@@ -61,6 +61,11 @@ type sdProgressMsg struct {
 	err  error
 }
 type downloadProgressMsg models.DownloadProgress
+type downloadStartedMsg struct {
+	id     string
+	ch     chan models.DownloadProgress
+	cancel context.CancelFunc
+}
 type wizardDoneMsg struct {
 	err error
 }
@@ -86,6 +91,8 @@ type AppModel struct {
 	chatViewport  viewport.Model
 	chatInput     textarea.Model
 	chatSidebar   bool
+	chatParams    bool
+	paramFocusIdx int
 	systemPrompt  textinput.Model
 	tempInput     textinput.Model
 	topPInput     textinput.Model
@@ -106,7 +113,7 @@ type AppModel struct {
 
 	// Images state
 	imgInputs     []textinput.Model
-	imgFocusIdx   int
+	imgFocusIdx   int // 0..8 = inputs, 9 = botão Gerar
 	imgGenerating bool
 	imgProgress   float64
 	imgCancel     context.CancelFunc
@@ -120,11 +127,13 @@ type AppModel struct {
 	installed      []models.InstalledModel
 	catalogIdx     int
 	installedIdx   int
+	focusInstalled bool
 	selectedLLM    string
 	selectedSD     string
 	importInput    textinput.Model
 	importingMode  bool
 	downloads      map[string]models.DownloadProgress
+	downloadChans  map[string]chan models.DownloadProgress
 	downloadCancel map[string]context.CancelFunc
 
 	// Monitor & Logs
@@ -140,7 +149,7 @@ func NewAppModel(deps AppDeps) AppModel {
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
 
-	vp := viewport.New(76, 14)
+	vp := viewport.New(76, 12)
 	logVp := viewport.New(76, 16)
 
 	sysIn := textinput.New()
@@ -234,6 +243,7 @@ func NewAppModel(deps AppDeps) AppModel {
 		scorchState:    theme.ScorchIdle,
 		chatViewport:   vp,
 		chatInput:      ta,
+		chatSidebar:    true,
 		systemPrompt:   sysIn,
 		tempInput:      tempIn,
 		topPInput:      topPIn,
@@ -250,6 +260,7 @@ func NewAppModel(deps AppDeps) AppModel {
 		selectedSD:     selSD,
 		importInput:    impIn,
 		downloads:      make(map[string]models.DownloadProgress),
+		downloadChans:  make(map[string]chan models.DownloadProgress),
 		downloadCancel: make(map[string]context.CancelFunc),
 		logFilter:      "all",
 		logViewport:    logVp,
@@ -257,6 +268,7 @@ func NewAppModel(deps AppDeps) AppModel {
 	if deps.SysMon != nil {
 		m.metrics = deps.SysMon.Sample()
 	}
+	m.resizeViewports()
 	m.refreshChatViewport(true)
 	return m
 }
@@ -352,16 +364,35 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case downloadStartedMsg:
+		m.downloadChans[msg.id] = msg.ch
+		m.downloadCancel[msg.id] = msg.cancel
+		return m, waitNextDownloadProgress(msg.id, msg.ch)
+
 	case downloadProgressMsg:
 		m.downloads[msg.ID] = models.DownloadProgress(msg)
 		if msg.Done {
 			delete(m.downloadCancel, msg.ID)
+			delete(m.downloadChans, msg.ID)
 			if msg.Err != nil {
-				m.errMsg = msg.Err.Error()
+				m.errMsg = "Erro no download: " + msg.Err.Error()
+				m.statusMsg = ""
 			} else if m.deps.ModelMgr != nil {
 				m.installed, _ = m.deps.ModelMgr.ListInstalled()
+				for _, im := range m.installed {
+					if im.Kind == models.KindLLM && m.selectedLLM == "" {
+						m.selectedLLM = im.Path
+					}
+					if im.Kind == models.KindCheckpoint && m.selectedSD == "" {
+						m.selectedSD = im.Path
+					}
+				}
 				m.statusMsg = "Download concluído: " + msg.Name
 			}
+			return m, nil
+		}
+		if ch, ok := m.downloadChans[msg.ID]; ok {
+			return m, waitNextDownloadProgress(msg.ID, ch)
 		}
 		return m, nil
 
@@ -380,24 +411,28 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
-	if m.activeTab == TabChat && !m.showSplash && !m.showWizard && !m.showHelp {
+	if m.activeTab == TabChat && !m.showSplash && !m.showWizard && !m.showHelp && !m.chatParams {
 		m.chatInput, cmd = m.chatInput.Update(msg)
 	}
 	return m, cmd
 }
 
 func (m *AppModel) resizeViewports() {
-	w := m.width - 6
+	sidebarW := 0
+	if m.chatSidebar && m.width >= 100 {
+		sidebarW = 28
+	}
+	w := m.width - sidebarW - 6
 	if w < 40 {
 		w = 40
 	}
-	h := m.height - 12
+	h := m.height - 14
 	if h < 6 {
 		h = 6
 	}
 	m.chatViewport.Width = w
 	m.chatViewport.Height = h
-	m.logViewport.Width = w
+	m.logViewport.Width = m.width - 6
 	m.logViewport.Height = h
 }
 
@@ -418,7 +453,7 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			if !m.wizardBusy && m.deps.ModelMgr != nil {
 				m.wizardBusy = true
-				m.wizardNote = "Baixando binários do backend..."
+				m.wizardNote = "Baixando binários do backend (llama-server e sd)..."
 				backendName := string(m.deps.Hardware.SelectedBackend)
 				mgr := m.deps.ModelMgr
 				return m, func() tea.Msg {
@@ -450,33 +485,45 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if key == "ctrl+c" || (key == "q" && m.activeTab != TabChat) {
+	if key == "ctrl+c" {
 		m.confirmQuit = true
 		return m, nil
 	}
 
-	switch key {
-	case "f1", "?":
-		m.showHelp = !m.showHelp
-		return m, nil
-	case "1":
-		m.activeTab = TabChat
-		return m, nil
-	case "2":
-		m.activeTab = TabImages
-		return m, nil
-	case "3":
-		m.activeTab = TabModels
-		return m, nil
-	case "4":
-		m.activeTab = TabMonitor
-		if m.deps.SysMon != nil {
-			m.metrics = m.deps.SysMon.Sample()
+	isTypingText := (m.activeTab == TabChat && !m.chatParams) ||
+		(m.activeTab == TabImages && m.imgFocusIdx < len(m.imgInputs)) ||
+		(m.activeTab == TabModels && m.importingMode)
+
+	if !isTypingText {
+		switch key {
+		case "q":
+			m.confirmQuit = true
+			return m, nil
+		case "f1", "?":
+			m.showHelp = !m.showHelp
+			return m, nil
+		case "1":
+			m.activeTab = TabChat
+			return m, nil
+		case "2":
+			m.activeTab = TabImages
+			return m, nil
+		case "3":
+			m.activeTab = TabModels
+			return m, nil
+		case "4":
+			m.activeTab = TabMonitor
+			if m.deps.SysMon != nil {
+				m.metrics = m.deps.SysMon.Sample()
+			}
+			return m, nil
+		case "5":
+			m.activeTab = TabLogs
+			m.refreshLogViewport()
+			return m, nil
 		}
-		return m, nil
-	case "5":
-		m.activeTab = TabLogs
-		m.refreshLogViewport()
+	} else if key == "f1" {
+		m.showHelp = !m.showHelp
 		return m, nil
 	}
 
@@ -550,13 +597,80 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	if m.chatParams {
+		inputs := []*textinput.Model{&m.systemPrompt, &m.tempInput, &m.topPInput, &m.maxTokInput}
+		switch key {
+		case "esc", "ctrl+p":
+			m.chatParams = false
+			m.chatInput.Focus()
+			return m, nil
+		case "tab", "down":
+			inputs[m.paramFocusIdx].Blur()
+			m.paramFocusIdx = (m.paramFocusIdx + 1) % len(inputs)
+			inputs[m.paramFocusIdx].Focus()
+			return m, nil
+		case "shift+tab", "up":
+			inputs[m.paramFocusIdx].Blur()
+			m.paramFocusIdx = (m.paramFocusIdx - 1 + len(inputs)) % len(inputs)
+			inputs[m.paramFocusIdx].Focus()
+			return m, nil
+		}
+		var cmd tea.Cmd
+		*inputs[m.paramFocusIdx], cmd = inputs[m.paramFocusIdx].Update(msg)
+		return m, cmd
+	}
+
 	switch key {
+	case "alt+1", "ctrl+1":
+		m.activeTab = TabChat
+		return m, nil
+	case "alt+2", "ctrl+2":
+		m.activeTab = TabImages
+		return m, nil
+	case "alt+3", "ctrl+3":
+		m.activeTab = TabModels
+		return m, nil
+	case "alt+4", "ctrl+4":
+		m.activeTab = TabMonitor
+		if m.deps.SysMon != nil {
+			m.metrics = m.deps.SysMon.Sample()
+		}
+		return m, nil
+	case "alt+5", "ctrl+5":
+		m.activeTab = TabLogs
+		m.refreshLogViewport()
+		return m, nil
 	case "ctrl+n":
 		m.activeConv = store.Conversation{
 			ID:    time.Now().Format("20060102-150405"),
 			Title: "Nova Conversa",
 		}
+		m.statusMsg = "Novo chat iniciado."
 		m.refreshChatViewport(true)
+		return m, nil
+	case "ctrl+h":
+		m.chatSidebar = !m.chatSidebar
+		m.resizeViewports()
+		return m, nil
+	case "ctrl+up":
+		if len(m.conversations) > 0 && m.convIdx > 0 {
+			m.convIdx--
+			m.activeConv = m.conversations[m.convIdx]
+			m.refreshChatViewport(true)
+		}
+		return m, nil
+	case "ctrl+down":
+		if len(m.conversations) > 0 && m.convIdx < len(m.conversations)-1 {
+			m.convIdx++
+			m.activeConv = m.conversations[m.convIdx]
+			m.refreshChatViewport(true)
+		}
+		return m, nil
+	case "ctrl+p":
+		m.chatParams = true
+		m.paramFocusIdx = 0
+		m.chatInput.Blur()
+		m.systemPrompt.Focus()
 		return m, nil
 	case "ctrl+r":
 		m.renamingConv = true
@@ -594,6 +708,14 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.chatInput.Reset()
 		m.errMsg = ""
 		m.scorchState = theme.ScorchThinking
+
+		if len(m.activeConv.Messages) == 0 && (m.activeConv.Title == "Sessão Inicial" || m.activeConv.Title == "Nova Conversa") {
+			title := prompt
+			if len(title) > 28 {
+				title = title[:28] + "..."
+			}
+			m.activeConv.Title = title
+		}
 
 		userMsg := llm.Message{
 			Role:      "user",
@@ -649,7 +771,7 @@ func (m *AppModel) startChatStreamCmd() tea.Cmd {
 			return streamChunkMsg{Err: fmt.Errorf("gerenciador de backend indisponível"), Done: true}
 		}
 		if modelPath == "" {
-			return streamChunkMsg{Err: fmt.Errorf("nenhum modelo LLM (.gguf) selecionado na aba Modelos"), Done: true}
+			return streamChunkMsg{Err: fmt.Errorf("nenhum modelo LLM (.gguf) selecionado na aba [3] Modelos"), Done: true}
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		endpoint, err := backendMgr.StartLlamaServer(ctx, modelPath, mmproj)
@@ -677,18 +799,38 @@ func waitNextStreamChunk(ch <-chan llm.StreamChunk) tea.Cmd {
 	}
 }
 
+func waitNextDownloadProgress(id string, ch <-chan models.DownloadProgress) tea.Cmd {
+	return func() tea.Msg {
+		prog, ok := <-ch
+		if !ok {
+			return downloadProgressMsg{ID: id, Done: true}
+		}
+		return downloadProgressMsg(prog)
+	}
+}
+
 func (m *AppModel) handleImagesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	totalFocus := len(m.imgInputs) + 1 // 0..8 = campos, 9 = botão Gerar
+
 	switch key {
-	case "tab":
-		m.imgInputs[m.imgFocusIdx].Blur()
-		m.imgFocusIdx = (m.imgFocusIdx + 1) % len(m.imgInputs)
-		m.imgInputs[m.imgFocusIdx].Focus()
+	case "tab", "down":
+		if m.imgFocusIdx < len(m.imgInputs) {
+			m.imgInputs[m.imgFocusIdx].Blur()
+		}
+		m.imgFocusIdx = (m.imgFocusIdx + 1) % totalFocus
+		if m.imgFocusIdx < len(m.imgInputs) {
+			m.imgInputs[m.imgFocusIdx].Focus()
+		}
 		return m, nil
-	case "shift+tab":
-		m.imgInputs[m.imgFocusIdx].Blur()
-		m.imgFocusIdx = (m.imgFocusIdx - 1 + len(m.imgInputs)) % len(m.imgInputs)
-		m.imgInputs[m.imgFocusIdx].Focus()
+	case "shift+tab", "up":
+		if m.imgFocusIdx < len(m.imgInputs) {
+			m.imgInputs[m.imgFocusIdx].Blur()
+		}
+		m.imgFocusIdx = (m.imgFocusIdx - 1 + totalFocus) % totalFocus
+		if m.imgFocusIdx < len(m.imgInputs) {
+			m.imgInputs[m.imgFocusIdx].Focus()
+		}
 		return m, nil
 	case "ctrl+x":
 		if m.imgGenerating && m.imgCancel != nil {
@@ -702,81 +844,101 @@ func (m *AppModel) handleImagesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			_ = render.OpenExternally(m.lastImagePath)
 		}
 		return m, nil
+	case "ctrl+g":
+		return m.triggerImageGeneration()
 	case "enter":
-		if m.imgGenerating {
-			return m, nil
+		if m.imgFocusIdx == len(m.imgInputs) {
+			return m.triggerImageGeneration()
 		}
-		if m.selectedSD == "" {
-			m.errMsg = "Selecione um checkpoint (.safetensors/.ckpt) na aba Modelos."
-			return m, nil
+		if m.imgFocusIdx < len(m.imgInputs) {
+			m.imgInputs[m.imgFocusIdx].Blur()
 		}
-		steps, _ := strconv.Atoi(m.imgInputs[2].Value())
-		if steps <= 0 {
-			steps = 20
+		m.imgFocusIdx = (m.imgFocusIdx + 1) % totalFocus
+		if m.imgFocusIdx < len(m.imgInputs) {
+			m.imgInputs[m.imgFocusIdx].Focus()
 		}
-		cfgScale, _ := strconv.ParseFloat(m.imgInputs[3].Value(), 64)
-		if cfgScale <= 0 {
-			cfgScale = 7.0
-		}
-		seed, _ := strconv.ParseInt(m.imgInputs[4].Value(), 10, 64)
-		if seed < 0 {
-			seed = time.Now().UnixNano() % 1_000_000_000
-		}
-		w, _ := strconv.Atoi(m.imgInputs[5].Value())
-		if w <= 0 {
-			w = 512
-		}
-		h, _ := strconv.Atoi(m.imgInputs[6].Value())
-		if h <= 0 {
-			h = 512
-		}
-		batch, _ := strconv.Atoi(m.imgInputs[8].Value())
-		if batch <= 0 {
-			batch = 1
-		}
-
-		params := imagegen.GenParams{
-			ModelPath:      m.selectedSD,
-			Prompt:         m.imgInputs[0].Value(),
-			NegativePrompt: m.imgInputs[1].Value(),
-			Steps:          steps,
-			CFGScale:       cfgScale,
-			Seed:           seed,
-			Width:          w,
-			Height:         h,
-			Sampler:        m.imgInputs[7].Value(),
-			BatchCount:     batch,
-		}
-
-		outDir := filepath.Join(m.deps.DataDir, "outputs")
-		_ = os.MkdirAll(outDir, 0o755)
-		outPath := filepath.Join(outDir, fmt.Sprintf("img_%s.png", time.Now().Format("20060102_150405")))
-		args := imagegen.BuildSDArgs(params, outPath)
-
-		ctx, cancel := context.WithCancel(context.Background())
-		m.imgCancel = cancel
-		m.imgGenerating = true
-		m.imgProgress = 0
-		m.scorchState = theme.ScorchThinking
-		m.errMsg = ""
-
-		mgr := m.deps.BackendMgr
-		return m, func() tea.Msg {
-			if mgr == nil {
-				return sdProgressMsg{done: true, err: fmt.Errorf("backend indisponível")}
-			}
-			err := mgr.RunStableDiffusion(ctx, args, nil)
-			if err != nil {
-				return sdProgressMsg{done: true, err: err}
-			}
-			_, _ = imagegen.SaveMetadata(outPath, params)
-			return sdProgressMsg{pct: 1.0, done: true, path: outPath}
-		}
+		return m, nil
 	}
 
-	var cmd tea.Cmd
-	m.imgInputs[m.imgFocusIdx], cmd = m.imgInputs[m.imgFocusIdx].Update(msg)
-	return m, cmd
+	if m.imgFocusIdx < len(m.imgInputs) {
+		var cmd tea.Cmd
+		m.imgInputs[m.imgFocusIdx], cmd = m.imgInputs[m.imgFocusIdx].Update(msg)
+		return m, cmd
+	}
+	return m, nil
+}
+
+func (m *AppModel) triggerImageGeneration() (tea.Model, tea.Cmd) {
+	if m.imgGenerating {
+		return m, nil
+	}
+	if m.selectedSD == "" {
+		m.errMsg = "Selecione um checkpoint (.safetensors/.ckpt) na aba [3] Modelos."
+		return m, nil
+	}
+	steps, _ := strconv.Atoi(m.imgInputs[2].Value())
+	if steps <= 0 {
+		steps = 20
+	}
+	cfgScale, _ := strconv.ParseFloat(m.imgInputs[3].Value(), 64)
+	if cfgScale <= 0 {
+		cfgScale = 7.0
+	}
+	seed, _ := strconv.ParseInt(m.imgInputs[4].Value(), 10, 64)
+	if seed < 0 {
+		seed = time.Now().UnixNano() % 1_000_000_000
+	}
+	w, _ := strconv.Atoi(m.imgInputs[5].Value())
+	if w <= 0 {
+		w = 512
+	}
+	h, _ := strconv.Atoi(m.imgInputs[6].Value())
+	if h <= 0 {
+		h = 512
+	}
+	batch, _ := strconv.Atoi(m.imgInputs[8].Value())
+	if batch <= 0 {
+		batch = 1
+	}
+
+	params := imagegen.GenParams{
+		ModelPath:      m.selectedSD,
+		Prompt:         m.imgInputs[0].Value(),
+		NegativePrompt: m.imgInputs[1].Value(),
+		Steps:          steps,
+		CFGScale:       cfgScale,
+		Seed:           seed,
+		Width:          w,
+		Height:         h,
+		Sampler:        m.imgInputs[7].Value(),
+		BatchCount:     batch,
+	}
+
+	outDir := filepath.Join(m.deps.DataDir, "outputs")
+	_ = os.MkdirAll(outDir, 0o755)
+	outPath := filepath.Join(outDir, fmt.Sprintf("img_%s.png", time.Now().Format("20060102_150405")))
+	args := imagegen.BuildSDArgs(params, outPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.imgCancel = cancel
+	m.imgGenerating = true
+	m.imgProgress = 0
+	m.scorchState = theme.ScorchThinking
+	m.errMsg = ""
+	m.statusMsg = "Gerando imagem..."
+
+	mgr := m.deps.BackendMgr
+	return m, func() tea.Msg {
+		if mgr == nil {
+			return sdProgressMsg{done: true, err: fmt.Errorf("backend indisponível")}
+		}
+		err := mgr.RunStableDiffusion(ctx, args, nil)
+		if err != nil {
+			return sdProgressMsg{done: true, err: err}
+		}
+		_, _ = imagegen.SaveMetadata(outPath, params)
+		return sdProgressMsg{pct: 1.0, done: true, path: outPath}
+	}
 }
 
 func (m *AppModel) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -793,8 +955,14 @@ func (m *AppModel) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if err != nil {
 					m.errMsg = err.Error()
 				} else {
+					m.errMsg = ""
 					m.statusMsg = "Modelo importado: " + inst.Name
 					m.installed, _ = m.deps.ModelMgr.ListInstalled()
+					if inst.Kind == models.KindLLM {
+						m.selectedLLM = inst.Path
+					} else if inst.Kind == models.KindCheckpoint {
+						m.selectedSD = inst.Path
+					}
 				}
 			}
 			return m, nil
@@ -808,34 +976,82 @@ func (m *AppModel) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch key {
+	case "tab":
+		m.focusInstalled = !m.focusInstalled
 	case "up", "k":
-		if m.catalogIdx > 0 {
+		if !m.focusInstalled && m.catalogIdx > 0 {
 			m.catalogIdx--
+		} else if m.focusInstalled && m.installedIdx > 0 {
+			m.installedIdx--
 		}
 	case "down", "j":
-		if m.catalogIdx < len(m.catalog)-1 {
+		if !m.focusInstalled && m.catalogIdx < len(m.catalog)-1 {
 			m.catalogIdx++
+		} else if m.focusInstalled && m.installedIdx < len(m.installed)-1 {
+			m.installedIdx++
 		}
 	case "i":
 		m.importingMode = true
 		m.importInput.Focus()
+	case "d", "delete":
+		if m.focusInstalled && len(m.installed) > 0 && m.installedIdx < len(m.installed) && m.deps.ModelMgr != nil {
+			target := m.installed[m.installedIdx]
+			if freed, err := m.deps.ModelMgr.DeleteModel(target.Path); err == nil {
+				m.statusMsg = fmt.Sprintf("Modelo removido (%d MB liberados).", freed/(1024*1024))
+				m.installed, _ = m.deps.ModelMgr.ListInstalled()
+				if m.installedIdx >= len(m.installed) && m.installedIdx > 0 {
+					m.installedIdx--
+				}
+			} else {
+				m.errMsg = err.Error()
+			}
+		}
 	case "enter":
+		if m.focusInstalled {
+			if len(m.installed) > 0 && m.installedIdx < len(m.installed) {
+				sel := m.installed[m.installedIdx]
+				if sel.Kind == models.KindLLM {
+					m.selectedLLM = sel.Path
+					m.statusMsg = "LLM ativo: " + sel.Name
+				} else {
+					m.selectedSD = sel.Path
+					m.statusMsg = "Checkpoint SD ativo: " + sel.Name
+				}
+			}
+			return m, nil
+		}
 		if len(m.catalog) > 0 && m.catalogIdx < len(m.catalog) && m.deps.ModelMgr != nil {
 			item := m.catalog[m.catalogIdx]
 			if _, exists := m.downloadCancel[item.ID]; exists {
+				m.statusMsg = "Download já em andamento: " + item.Name
 				return m, nil
 			}
+			m.errMsg = ""
+			m.statusMsg = "Iniciando download: " + item.Name
+			m.downloads[item.ID] = models.DownloadProgress{
+				ID:   item.ID,
+				Name: item.Name,
+			}
 			ctx, cancel := context.WithCancel(context.Background())
-			m.downloadCancel[item.ID] = cancel
+			ch := make(chan models.DownloadProgress, 16)
 			mgr := m.deps.ModelMgr
-			return m, func() tea.Msg {
-				err := mgr.DownloadWithResume(ctx, item, nil)
-				return downloadProgressMsg{
+			go func() {
+				err := mgr.DownloadWithResume(ctx, item, func(p models.DownloadProgress) {
+					select {
+					case ch <- p:
+					default:
+					}
+				})
+				ch <- models.DownloadProgress{
 					ID:   item.ID,
 					Name: item.Name,
 					Done: true,
 					Err:  err,
 				}
+				close(ch)
+			}()
+			return m, func() tea.Msg {
+				return downloadStartedMsg{id: item.ID, ch: ch, cancel: cancel}
 			}
 		}
 	}
@@ -889,26 +1105,34 @@ func (m AppModel) View() string {
 
 	if m.showSplash {
 		return lipgloss.NewStyle().Padding(2, 4).Render(
-			fmt.Sprintf("Local AI Studio TUI\n\nBackend: %s | GPU: %s\n\nPressione Enter para continuar.",
-				m.deps.Hardware.SelectedBackend, m.deps.Hardware.GPUName),
+			fmt.Sprintf("%s\n\nBackend: %s | GPU: %s\n\nPressione Enter para continuar.",
+				pal.Accent.Render("Local AI Studio TUI"), m.deps.Hardware.SelectedBackend, m.deps.Hardware.GPUName),
 		)
 	}
 
 	if m.showWizard {
 		return lipgloss.NewStyle().Padding(2, 4).Render(
-			fmt.Sprintf("Configuração Inicial de Binários\n\n%s\n\n[Enter] Baixar binários   [Esc] Pular", m.wizardNote),
+			fmt.Sprintf("%s\n\n%s\n\n%s   [Esc] Pular",
+				pal.Accent.Render("Configuração Inicial de Binários"),
+				m.wizardNote,
+				pal.Selected.Render("[Enter] Baixar binários")),
 		)
 	}
 
 	if m.showHelp {
 		return lipgloss.NewStyle().Padding(2, 4).Render(
-			"Atalhos Principais\n\n1..5: Alternar abas (Chat, Imagens, Modelos, Monitor, Logs)\nCtrl+N: Nova conversa | Ctrl+R: Renomear | Ctrl+A: Anexar imagem | Ctrl+Y: Copiar\nCtrl+S: Parar chat | Ctrl+X: Cancelar imagem | Ctrl+C: Sair | ? / F1: Ajuda",
+			pal.Accent.Render("Atalhos Principais") + "\n\n" +
+				"1..5 (ou Alt+1..5): Alternar abas (Chat, Imagens, Modelos, Monitor, Logs)\n" +
+				"Chat: Ctrl+N Novo chat | Ctrl+H Histórico | Ctrl+↑/↓ Trocar chat | Ctrl+P Parâmetros | Ctrl+R Renomear | Ctrl+A Anexar | Ctrl+Y Copiar | Ctrl+S Parar\n" +
+				"Imagens: ↑/↓/Tab Navegar campos | Ctrl+G Gerar imagem | Ctrl+X Cancelar | Ctrl+O Abrir\n" +
+				"Modelos: ↑/↓ Navegar | Enter Baixar/Selecionar | Tab Alternar lista | i Importar local | d Excluir\n" +
+				"Geral: ? ou F1 Ajuda | Ctrl+C Sair",
 		)
 	}
 
 	if m.confirmQuit {
 		return lipgloss.NewStyle().Padding(2, 4).Render(
-			"Encerrar Local AI Studio e finalizar processos ativos? [y/N]",
+			pal.Selected.Render("Encerrar Local AI Studio e finalizar processos ativos? [y/N]"),
 		)
 	}
 
@@ -926,32 +1150,149 @@ func (m AppModel) View() string {
 	var body string
 	switch m.activeTab {
 	case TabChat:
-		body = fmt.Sprintf("%s\n\n%s", m.chatViewport.View(), m.chatInput.View())
+		toolbar := pal.Muted.Render("[Ctrl+N] Novo Chat  [Ctrl+H] Histórico  [Ctrl+↑/↓] Alternar  [Ctrl+P] Parâmetros  [Ctrl+R] Renomear  [Ctrl+A] Anexar  [Ctrl+Y] Copiar")
+		mainChat := fmt.Sprintf("%s\n\n%s", m.chatViewport.View(), m.chatInput.View())
+		if m.renamingConv {
+			mainChat = "Renomear conversa: " + m.renameInput.View() + "\n\n" + mainChat
+		}
+		if m.attachingImg {
+			mainChat = "Anexar imagem: " + m.attachInput.View() + "\n\n" + mainChat
+		}
+		if m.chatParams {
+			pLabels := []string{"System Prompt", "Temperature", "Top-P", "Max Tokens"}
+			pInputs := []textinput.Model{m.systemPrompt, m.tempInput, m.topPInput, m.maxTokInput}
+			var pLines []string
+			pLines = append(pLines, pal.Accent.Render("Parâmetros do Chat (↑/↓/Tab navegar, Esc fechar):"))
+			for i, lbl := range pLabels {
+				prefix := "  "
+				if i == m.paramFocusIdx {
+					prefix = pal.Selected.Render("> ")
+				}
+				pLines = append(pLines, fmt.Sprintf("%s%s: %s", prefix, lbl, pInputs[i].View()))
+			}
+			mainChat = strings.Join(pLines, "\n") + "\n\n" + mainChat
+		}
+
+		if m.chatSidebar && m.width >= 100 {
+			var sideLines []string
+			sideLines = append(sideLines, pal.Selected.Render("+ Novo Chat [Ctrl+N]"))
+			sideLines = append(sideLines, pal.Muted.Render("Conversas Recentes:"))
+			if len(m.conversations) == 0 {
+				sideLines = append(sideLines, pal.Muted.Render("  (nenhuma salva)"))
+			}
+			for i, c := range m.conversations {
+				if i >= 12 {
+					break
+				}
+				title := c.Title
+				if len(title) > 20 {
+					title = title[:20] + "…"
+				}
+				if c.ID == m.activeConv.ID {
+					sideLines = append(sideLines, pal.Selected.Render("> "+title))
+				} else {
+					sideLines = append(sideLines, "  "+title)
+				}
+			}
+			sidebarBox := lipgloss.NewStyle().
+				Width(26).
+				Border(pal.Border).
+				Padding(0, 1).
+				Render(strings.Join(sideLines, "\n"))
+			body = lipgloss.JoinVertical(lipgloss.Left, toolbar, lipgloss.JoinHorizontal(lipgloss.Top, sidebarBox, "  ", mainChat))
+		} else {
+			body = lipgloss.JoinVertical(lipgloss.Left, toolbar, mainChat)
+		}
+
 	case TabImages:
-		body = fmt.Sprintf("Prompt: %s\nPassos: %s | CFG: %s | Seed: %s | Tamanho: %sx%s\nProgresso: %.0f%%\n\n%s",
-			m.imgInputs[0].View(), m.imgInputs[2].View(), m.imgInputs[3].View(),
-			m.imgInputs[4].View(), m.imgInputs[5].View(), m.imgInputs[6].View(),
-			m.imgProgress*100, m.lastImageView)
+		fieldLabels := []string{
+			"Prompt",
+			"Negative Prompt",
+			"Passos (Steps)",
+			"CFG Scale",
+			"Seed (-1 aleatório)",
+			"Largura (Width)",
+			"Altura (Height)",
+			"Sampler",
+			"Batch Count",
+		}
+		var formLines []string
+		formLines = append(formLines, pal.Muted.Render("Navegue com ↑/↓ ou Tab • Gere com [Ctrl+G] ou Enter no botão abaixo:"))
+		for i, lbl := range fieldLabels {
+			prefix := "  "
+			labelStyled := lbl
+			if m.imgFocusIdx == i {
+				prefix = pal.Selected.Render("> ")
+				labelStyled = pal.Selected.Render(lbl)
+			}
+			formLines = append(formLines, fmt.Sprintf("%s%s: %s", prefix, labelStyled, m.imgInputs[i].View()))
+		}
+		genBtn := "[ Gerar Imagem ]"
+		if m.imgFocusIdx == len(m.imgInputs) {
+			genBtn = pal.ActiveTab.Render("[ Gerar Imagem ]")
+		} else {
+			genBtn = pal.Selected.Render("[ Gerar Imagem ]")
+		}
+		formLines = append(formLines, "", "  "+genBtn+fmt.Sprintf("   Progresso: %.0f%%", m.imgProgress*100))
+		if m.lastImageView != "" {
+			formLines = append(formLines, "", m.lastImageView)
+		}
+		body = strings.Join(formLines, "\n")
+
 	case TabModels:
 		var lines []string
-		lines = append(lines, "Catálogo disponível ([Enter] baixar, [i] importar arquivo local):")
+		lines = append(lines, "Catálogo disponível ([Enter] baixar, [i] importar local, [Tab] alternar lista):")
 		for idx, item := range m.catalog {
-			prefix := "  "
-			if idx == m.catalogIdx {
-				prefix = "> "
+			isSel := !m.focusInstalled && idx == m.catalogIdx
+			line := fmt.Sprintf("%s (%s)", item.Name, item.SizeHuman)
+			if prog, ok := m.downloads[item.ID]; ok && !prog.Done {
+				pct := 0.0
+				if prog.Total > 0 {
+					pct = float64(prog.Downloaded) * 100 / float64(prog.Total)
+				}
+				line += fmt.Sprintf("  [Baixando: %.1f%% | %.1f MB/s]", pct, prog.SpeedBPS/(1024*1024))
 			}
-			lines = append(lines, fmt.Sprintf("%s%s (%s)", prefix, item.Name, item.SizeHuman))
+			if isSel {
+				lines = append(lines, pal.Selected.Render("> "+line))
+			} else {
+				lines = append(lines, "  "+line)
+			}
 		}
-		lines = append(lines, fmt.Sprintf("\nInstalados: %d | LLM ativo: %s | SD ativo: %s",
-			len(m.installed), filepath.Base(m.selectedLLM), filepath.Base(m.selectedSD)))
+
+		lines = append(lines, "", fmt.Sprintf("Modelos Instalados (%d) — [Enter] ativar, [d] remover:", len(m.installed)))
+		if len(m.installed) == 0 {
+			lines = append(lines, pal.Muted.Render("  Nenhum modelo instalado ainda."))
+		}
+		for idx, im := range m.installed {
+			isSel := m.focusInstalled && idx == m.installedIdx
+			activeTag := ""
+			if im.Path == m.selectedLLM || im.Path == m.selectedSD {
+				activeTag = " [ATIVO]"
+			}
+			line := fmt.Sprintf("%s [%s]%s", im.Name, im.Kind, activeTag)
+			if isSel {
+				lines = append(lines, pal.Selected.Render("> "+line))
+			} else {
+				lines = append(lines, "  "+line)
+			}
+		}
+
 		if m.importingMode {
 			lines = append(lines, "\nImportar: "+m.importInput.View())
 		}
 		body = strings.Join(lines, "\n")
+
 	case TabMonitor:
-		body = fmt.Sprintf("CPU: %.1f%% | RAM: %d / %d MB (%.1f%%)\nGPU (%s): %.1f%% | VRAM: %d / %d MB",
-			m.metrics.CPUPercent, m.metrics.RAMUsedMB, m.metrics.RAMTotalMB, m.metrics.RAMPercent,
-			m.metrics.GPUSource, m.metrics.GPUPercent, m.metrics.VRAMUsedMB, m.metrics.VRAMTotalMB)
+		gpuLabel := m.metrics.GPUSource
+		if gpuLabel == "" {
+			gpuLabel = m.deps.Hardware.GPUName
+		}
+		body = fmt.Sprintf("CPU (%s): %.1f%%\nRAM: %d / %d MB (%.1f%%)\nGPU (%s | Backend: %s): %.1f%% | VRAM: %d / %d MB",
+			m.deps.Hardware.CPUName, m.metrics.CPUPercent,
+			m.metrics.RAMUsedMB, m.metrics.RAMTotalMB, m.metrics.RAMPercent,
+			gpuLabel, m.deps.Hardware.SelectedBackend,
+			m.metrics.GPUPercent, m.metrics.VRAMUsedMB, m.metrics.VRAMTotalMB)
+
 	case TabLogs:
 		body = fmt.Sprintf("Filtro ([f]): %s\n\n%s", m.logFilter, m.logViewport.View())
 	}
