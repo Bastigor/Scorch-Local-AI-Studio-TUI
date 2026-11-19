@@ -1,7 +1,6 @@
 package models
 
 import (
-	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -34,12 +32,6 @@ type CatalogItem struct {
 	MmprojFile string    `json:"mmproj_file,omitempty"`
 	MmprojURL  string    `json:"mmproj_url,omitempty"`
 	Starter    bool      `json:"starter,omitempty"`
-}
-
-type BinaryRelease struct {
-	Name   string
-	URL    string
-	SHA256 string
 }
 
 type InstalledModel struct {
@@ -96,127 +88,7 @@ func DefaultCatalog() []CatalogItem {
 			SizeHuman: "3.46 GB",
 			URL:       "https://huggingface.co/stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors",
 		},
-		{
-			ID:        "sd15-pruned",
-			Name:      "Stable Diffusion v1.5 Pruned (FP16)",
-			Filename:  "v1-5-pruned-emaonly.safetensors",
-			Kind:      KindCheckpoint,
-			SizeHuman: "4.27 GB",
-			URL:       "https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors",
-		},
 	}
-}
-
-func DefaultBackendReleases(backend string) []BinaryRelease {
-	switch runtime.GOOS {
-	case "windows":
-		llamaURL := "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-win-avx2-x64.zip"
-		sdURL := "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-win-avx2-x64.zip"
-		if backend == "cuda" {
-			llamaURL = "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-win-cuda-cu12.4-x64.zip"
-			sdURL = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-win-cuda12-x64.zip"
-		} else if backend == "vulkan" {
-			llamaURL = "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-win-vulkan-x64.zip"
-			sdURL = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-win-vulkan-x64.zip"
-		}
-		return []BinaryRelease{
-			{Name: "llama-server.exe", URL: llamaURL},
-			{Name: "sd.exe", URL: sdURL},
-		}
-	case "darwin":
-		return []BinaryRelease{
-			{Name: "llama-server", URL: "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-macos-arm64.zip"},
-			{Name: "sd", URL: "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-Darwin-arm64.zip"},
-		}
-	default:
-		arch := "x64"
-		if runtime.GOARCH == "arm64" {
-			arch = "arm64"
-		}
-		llamaURL := fmt.Sprintf("https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-ubuntu-%s.zip", arch)
-		sdURL := fmt.Sprintf("https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-Linux-Ubuntu-%s.zip", arch)
-		if backend == "vulkan" && arch == "x64" {
-			llamaURL = "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-ubuntu-vulkan-x64.zip"
-		}
-		return []BinaryRelease{
-			{Name: "llama-server", URL: llamaURL},
-			{Name: "sd", URL: sdURL},
-		}
-	}
-}
-
-func (m *Manager) InstallBackendBinaries(ctx context.Context, backend string, onStatus func(string)) error {
-	binDir := filepath.Join(m.dataDir, "bin")
-	cacheDir := filepath.Join(m.dataDir, "cache")
-	_ = os.MkdirAll(binDir, 0o755)
-	_ = os.MkdirAll(cacheDir, 0o755)
-
-	releases := DefaultBackendReleases(backend)
-	for _, rel := range releases {
-		if onStatus != nil {
-			onStatus(fmt.Sprintf("Baixando %s...", rel.Name))
-		}
-		zipPath := filepath.Join(cacheDir, rel.Name+".zip")
-		if err := m.downloadFileRaw(ctx, rel.URL, zipPath, rel.SHA256, nil); err != nil {
-			return fmt.Errorf("falha ao baixar %s: %w", rel.Name, err)
-		}
-		if onStatus != nil {
-			onStatus(fmt.Sprintf("Extraindo %s...", rel.Name))
-		}
-		if err := extractBinaryFromZip(zipPath, binDir, rel.Name); err != nil {
-			return fmt.Errorf("falha ao extrair %s: %w", rel.Name, err)
-		}
-	}
-	return nil
-}
-
-func extractBinaryFromZip(zipPath, destDir, targetBin string) error {
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	found := false
-	for _, f := range r.File {
-		if f.FileInfo().IsDir() {
-			continue
-		}
-		base := filepath.Base(f.Name)
-		// Extrai o executável alvo e bibliotecas compartilhadas adjacentes (.dll, .so*, .dylib, .metal)
-		isTarget := strings.EqualFold(base, targetBin)
-		isRuntimeLib := strings.HasSuffix(base, ".dll") || strings.Contains(base, ".so") ||
-			strings.HasSuffix(base, ".dylib") || strings.HasSuffix(base, ".metal")
-		if !isTarget && !isRuntimeLib {
-			continue
-		}
-		destPath, err := SafeResolveUnder(destDir, base)
-		if err != nil {
-			continue
-		}
-		rc, err := f.Open()
-		if err != nil {
-			return err
-		}
-		out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-		if err != nil {
-			_ = rc.Close()
-			return err
-		}
-		_, copyErr := io.Copy(out, rc)
-		_ = out.Close()
-		_ = rc.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		if isTarget {
-			found = true
-		}
-	}
-	if !found {
-		return fmt.Errorf("executável %s não encontrado dentro do pacote %s", targetBin, filepath.Base(zipPath))
-	}
-	return nil
 }
 
 func (m *Manager) LoadOrCreateCatalog() ([]CatalogItem, error) {
@@ -247,7 +119,7 @@ func ValidateModelFile(path string) (ModelKind, error) {
 		{"control_", "arquivo identificado como ControlNet; não pode ser executado como modelo principal"},
 		{"clip", "arquivo identificado como Text Encoder/CLIP isolado"},
 		{"t5xxl", "arquivo identificado como Text Encoder T5 isolado"},
-		{"mmproj", "arquivo identificado como projetor multimodal (mmproj); importe-o após selecionar um LLM"},
+		{"mmproj", "arquivo identificado como projetor multimodal (mmproj)"},
 	}
 
 	for _, rp := range rejectPatterns {
@@ -365,7 +237,6 @@ func (m *Manager) ListInstalled() ([]InstalledModel, error) {
 			if info != nil {
 				sz = info.Size()
 			}
-			// Detecta mmproj pareado na mesma pasta (ex: mmproj-*.gguf)
 			var mmproj string
 			if spec.kind == KindLLM {
 				for _, cand := range entries {
@@ -425,21 +296,6 @@ func (m *Manager) DownloadWithResume(ctx context.Context, item CatalogItem, onPr
 	if err != nil {
 		return err
 	}
-	return m.downloadFileRaw(ctx, item.URL, finalPath, item.SHA256, func(dl, tot int64, bps float64, eta int) {
-		if onProgress != nil {
-			onProgress(DownloadProgress{
-				ID:         item.ID,
-				Name:       item.Name,
-				Downloaded: dl,
-				Total:      tot,
-				SpeedBPS:   bps,
-				ETASeconds: eta,
-			})
-		}
-	})
-}
-
-func (m *Manager) downloadFileRaw(ctx context.Context, url, finalPath, expectedSHA string, onTick func(dl, tot int64, bps float64, eta int)) error {
 	partPath := finalPath + ".part"
 
 	var existing int64
@@ -447,7 +303,7 @@ func (m *Manager) downloadFileRaw(ctx context.Context, url, finalPath, expectedS
 		existing = st.Size()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, item.URL, nil)
 	if err != nil {
 		return err
 	}
@@ -498,7 +354,7 @@ func (m *Manager) downloadFileRaw(ctx context.Context, url, finalPath, expectedS
 				return wErr
 			}
 			downloaded += int64(n)
-			if onTick != nil && time.Since(lastEmit) >= 200*time.Millisecond {
+			if onProgress != nil && time.Since(lastEmit) >= 200*time.Millisecond {
 				lastEmit = time.Now()
 				elapsed := time.Since(start).Seconds()
 				var bps float64
@@ -509,7 +365,14 @@ func (m *Manager) downloadFileRaw(ctx context.Context, url, finalPath, expectedS
 						eta = int(float64(total-downloaded) / bps)
 					}
 				}
-				onTick(downloaded, total, bps, eta)
+				onProgress(DownloadProgress{
+					ID:         item.ID,
+					Name:       item.Name,
+					Downloaded: downloaded,
+					Total:      total,
+					SpeedBPS:   bps,
+					ETASeconds: eta,
+				})
 			}
 		}
 		if readErr == io.EOF {
@@ -522,8 +385,8 @@ func (m *Manager) downloadFileRaw(ctx context.Context, url, finalPath, expectedS
 	}
 	_ = f.Close()
 
-	if expectedSHA != "" {
-		if err := VerifySHA256(partPath, expectedSHA); err != nil {
+	if item.SHA256 != "" {
+		if err := VerifySHA256(partPath, item.SHA256); err != nil {
 			return err
 		}
 	}
