@@ -21,7 +21,7 @@ func PaletteFor(themeName string, colorDepth string, ascii bool) Palette {
 
 	border := lipgloss.RoundedBorder()
 	if ascii {
-		border = lipgloss.ASCIIBorder()
+		border = lipgloss.AsciiBorder()
 	}
 
 	if noColor {
