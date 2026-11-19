@@ -56,7 +56,16 @@ func New(light, ascii bool) Theme {
 
 	border := lipgloss.RoundedBorder()
 	if ascii {
-		border = lipgloss.ASCIIBorder()
+		border = lipgloss.Border{
+			Top:         "-",
+			Bottom:      "-",
+			Left:        "|",
+			Right:       "|",
+			TopLeft:     "+",
+			TopRight:    "+",
+			BottomLeft:  "+",
+			BottomRight: "+",
+		}
 	}
 
 	successMark := "✓"
