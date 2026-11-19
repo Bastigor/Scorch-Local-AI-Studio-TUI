@@ -37,13 +37,14 @@ type Info struct {
 	GPUVendor         string
 	VRAMMB            int
 	SelectedBackend   BackendType
+	FallbackBackends  []BackendType
 	Supported         bool
 	UnsupportedReason string
 	MissingPrereqs    []Prereq
 }
 
 func Detect() Info {
-	info := Info{
+	base := Info{
 		OS:              runtime.GOOS,
 		Arch:            runtime.GOARCH,
 		CPUName:         "Unknown CPU",
@@ -56,18 +57,42 @@ func Detect() Info {
 
 	if cpuInfos, err := cpu.Info(); err == nil && len(cpuInfos) > 0 {
 		if name := strings.TrimSpace(cpuInfos[0].ModelName); name != "" {
-			info.CPUName = name
+			base.CPUName = name
 		}
 	}
 	if vm, err := mem.VirtualMemory(); err == nil && vm != nil {
-		info.TotalRAMBytes = vm.Total
+		base.TotalRAMBytes = vm.Total
 	}
 
-	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+	return ProbeEnv(base)
+}
+
+func ProbeEnv(info Info) Info {
+	if info.OS == "" {
+		info.OS = runtime.GOOS
+	}
+	if info.Arch == "" {
+		info.Arch = runtime.GOARCH
+	}
+	if info.CPUCores <= 0 {
+		info.CPUCores = runtime.NumCPU()
+	}
+	if info.GPUName == "" {
+		info.GPUName = "CPU Fallback"
+	}
+	if info.GPUVendor == "" {
+		info.GPUVendor = "none"
+	}
+	info.SelectedBackend = BackendCPU
+	info.FallbackBackends = []BackendType{BackendCPU}
+	info.Supported = true
+
+	if info.OS == "darwin" && info.Arch == "arm64" {
 		info.GPUName = "Apple Silicon GPU"
 		info.GPUVendor = "apple"
 		info.SelectedBackend = BackendMetal
-		if info.TotalRAMBytes > 0 {
+		info.FallbackBackends = []BackendType{BackendMetal, BackendCPU}
+		if info.TotalRAMBytes > 0 && info.VRAMMB == 0 {
 			info.VRAMMB = int(info.TotalRAMBytes / (1024 * 1024))
 		}
 		return info
@@ -78,6 +103,7 @@ func Detect() Info {
 		info.GPUVendor = "nvidia"
 		info.VRAMMB = vram
 		info.SelectedBackend = BackendCUDA
+		info.FallbackBackends = []BackendType{BackendCUDA, BackendVulkan, BackendCPU}
 		return info
 	}
 
@@ -86,10 +112,11 @@ func Detect() Info {
 		info.GPUVendor = "amd"
 		info.VRAMMB = vram
 		info.SelectedBackend = BackendROCm
+		info.FallbackBackends = []BackendType{BackendROCm, BackendVulkan, BackendCPU}
 		return info
 	}
 
-	if runtime.GOOS == "windows" {
+	if info.OS == "windows" {
 		if gpuName, vendor, vram, ok := detectWindowsVideoController(); ok {
 			info.GPUName = gpuName
 			info.GPUVendor = vendor
@@ -97,10 +124,13 @@ func Detect() Info {
 			switch vendor {
 			case "nvidia":
 				info.SelectedBackend = BackendCUDA
+				info.FallbackBackends = []BackendType{BackendCUDA, BackendVulkan, BackendCPU}
 			case "amd", "intel":
 				info.SelectedBackend = BackendVulkan
+				info.FallbackBackends = []BackendType{BackendVulkan, BackendCPU}
 			default:
 				info.SelectedBackend = BackendCPU
+				info.FallbackBackends = []BackendType{BackendCPU}
 			}
 			return info
 		}
