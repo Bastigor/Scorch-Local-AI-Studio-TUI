@@ -63,7 +63,8 @@ func main() {
 		return
 	}
 
-	cfg, err := store.LoadOrCreateConfig(filepath.Join(dataDir, "config.toml"))
+	cfgPath := filepath.Join(dataDir, "config.toml")
+	cfg, err := store.LoadOrCreateConfig(cfgPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Aviso de configuração: %v\n", err)
 	}
@@ -99,7 +100,6 @@ func main() {
 	appModel := tui.NewAppModel(tui.AppDeps{
 		DataDir:    dataDir,
 		Config:     cfg,
-		ConfigPath: filepath.Join(dataDir, "config.toml"),
 		Hardware:   hw,
 		TermCaps:   caps,
 		BackendMgr: backendMgr,
