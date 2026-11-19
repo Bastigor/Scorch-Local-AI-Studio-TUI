@@ -3,6 +3,7 @@ package store
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -10,36 +11,74 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
-
 	"local-ai-studio-tui/internal/llm"
 )
 
+type ChatConfig struct {
+	SystemPrompt string  `toml:"system_prompt"`
+	Temperature  float64 `toml:"temperature"`
+	TopP         float64 `toml:"top_p"`
+	MaxTokens    int     `toml:"max_tokens"`
+}
+
+type ImageConfig struct {
+	Steps      int     `toml:"steps"`
+	CFGScale   float64 `toml:"cfg_scale"`
+	Width      int     `toml:"width"`
+	Height     int     `toml:"height"`
+	Sampler    string  `toml:"sampler"`
+	BatchCount int     `toml:"batch_count"`
+}
+
+type UIConfig struct {
+	Theme        string `toml:"theme"`
+	ASCII        bool   `toml:"ascii"`
+	ReduceMotion bool   `toml:"reduce_motion"`
+	ImageMode    string `toml:"image_mode"`
+}
+
 type Config struct {
-	UI struct {
-		Theme        string `toml:"theme"`
-		ASCII        bool   `toml:"ascii"`
-		ReduceMotion bool   `toml:"reduce_motion"`
-		ImageMode    string `toml:"image_mode"`
-		Mouse        bool   `toml:"mouse"`
-	} `toml:"ui"`
-	Chat struct {
-		SystemPrompt string  `toml:"system_prompt"`
-		Temperature  float64 `toml:"temperature"`
-		TopP         float64 `toml:"top_p"`
-		MaxTokens    int     `toml:"max_tokens"`
-	} `toml:"chat"`
+	Chat  ChatConfig  `toml:"chat"`
+	Image ImageConfig `toml:"image"`
+	UI    UIConfig    `toml:"ui"`
 }
 
 func DefaultConfig() Config {
-	var c Config
-	c.UI.Theme = "dark"
-	c.UI.ImageMode = "auto"
-	c.UI.Mouse = true
-	c.Chat.SystemPrompt = "Você é um assistente de engenharia de software conciso e preciso."
-	c.Chat.Temperature = 0.7
-	c.Chat.TopP = 0.9
-	c.Chat.MaxTokens = 2048
-	return c
+	return Config{
+		Chat: ChatConfig{
+			SystemPrompt: "Você é um assistente técnico útil, direto e preciso.",
+			Temperature:  0.7,
+			TopP:         0.9,
+			MaxTokens:    1024,
+		},
+		Image: ImageConfig{
+			Steps:      20,
+			CFGScale:   7.0,
+			Width:      512,
+			Height:     512,
+			Sampler:    "euler",
+			BatchCount: 1,
+		},
+		UI: UIConfig{
+			Theme:        "auto",
+			ASCII:        false,
+			ReduceMotion: false,
+			ImageMode:    "auto",
+		},
+	}
+}
+
+func ResolveDataDir(flagDir, envDir, exePath string) string {
+	if strings.TrimSpace(flagDir) != "" {
+		return filepath.Clean(flagDir)
+	}
+	if strings.TrimSpace(envDir) != "" {
+		return filepath.Clean(envDir)
+	}
+	if strings.TrimSpace(exePath) != "" {
+		return filepath.Join(filepath.Dir(exePath), "studio-data")
+	}
+	return "studio-data"
 }
 
 func EnsureLayout(dataDir string) error {
@@ -54,45 +93,88 @@ func EnsureLayout(dataDir string) error {
 	}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o755); err != nil {
-			return err
+			return fmt.Errorf("falha ao criar diretório %s: %w", d, err)
+		}
+	}
+	return nil
+}
+
+func ResetRuntimeDirs(dataDir string) error {
+	for _, sub := range []string{"bin", "cache"} {
+		target := filepath.Join(dataDir, sub)
+		if err := os.RemoveAll(target); err != nil {
+			return fmt.Errorf("falha ao limpar %s: %w", sub, err)
+		}
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			return fmt.Errorf("falha ao recriar %s: %w", sub, err)
 		}
 	}
 	return nil
 }
 
 func LoadOrCreateConfig(path string) (Config, error) {
-	if raw, err := os.ReadFile(path); err == nil {
-		cfg := DefaultConfig()
-		if err := toml.Unmarshal(raw, &cfg); err != nil {
-			return cfg, err
-		}
-		return cfg, nil
-	}
 	cfg := DefaultConfig()
-	raw, err := toml.Marshal(cfg)
+	raw, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			if saveErr := SaveConfig(path, cfg); saveErr != nil {
+				return cfg, saveErr
+			}
+			return cfg, nil
+		}
 		return cfg, err
 	}
-	return cfg, os.WriteFile(path, raw, 0o644)
+	if err := toml.Unmarshal(raw, &cfg); err != nil {
+		return DefaultConfig(), fmt.Errorf("config.toml inválido: %w", err)
+	}
+	if cfg.Chat.MaxTokens <= 0 {
+		cfg.Chat.MaxTokens = DefaultConfig().Chat.MaxTokens
+	}
+	if cfg.Image.Steps <= 0 {
+		cfg.Image.Steps = DefaultConfig().Image.Steps
+	}
+	if cfg.Image.Width <= 0 {
+		cfg.Image.Width = DefaultConfig().Image.Width
+	}
+	if cfg.Image.Height <= 0 {
+		cfg.Image.Height = DefaultConfig().Image.Height
+	}
+	if cfg.Image.BatchCount <= 0 {
+		cfg.Image.BatchCount = DefaultConfig().Image.BatchCount
+	}
+	return cfg, nil
+}
+
+func SaveConfig(path string, cfg Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := toml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 type Conversation struct {
-	ID        string        `json:"id"`
-	Title     string        `json:"title"`
-	UpdatedAt time.Time     `json:"updated_at"`
-	Messages  []llm.Message `json:"messages"`
+	ID        string         `json:"id"`
+	Title     string         `json:"title"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	Messages  []llm.Message  `json:"messages"`
 }
 
-type jsonlHeader struct {
+type conversationMetaLine struct {
 	Type      string    `json:"type"`
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-type jsonlMessageRow struct {
-	Type    string      `json:"type"`
-	Message llm.Message `json:"message"`
+type conversationMsgLine struct {
+	Type    string       `json:"type"`
+	Message llm.Message  `json:"message"`
 }
 
 type ConversationStore struct {
@@ -100,116 +182,141 @@ type ConversationStore struct {
 }
 
 func NewConversationStore(dir string) *ConversationStore {
-	_ = os.MkdirAll(dir, 0o755)
 	return &ConversationStore{dir: dir}
 }
 
-func (s *ConversationStore) List() ([]Conversation, error) {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return nil, err
+func (s *ConversationStore) filePath(id string) string {
+	cleanID := filepath.Base(id)
+	if !strings.HasSuffix(cleanID, ".jsonl") {
+		cleanID += ".jsonl"
 	}
-	var out []Conversation
-	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
-			continue
-		}
-		c, err := s.loadFile(filepath.Join(s.dir, e.Name()))
-		if err == nil {
-			out = append(out, c)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].UpdatedAt.After(out[j].UpdatedAt)
-	})
-	return out, nil
+	return filepath.Join(s.dir, cleanID)
 }
 
-func (s *ConversationStore) loadFile(path string) (Conversation, error) {
-	f, err := os.Open(path)
+func (s *ConversationStore) Save(conv Conversation) error {
+	if err := os.MkdirAll(s.dir, 0o755); err != nil {
+		return err
+	}
+	if strings.TrimSpace(conv.ID) == "" {
+		conv.ID = fmt.Sprintf("conv-%d", time.Now().UnixNano())
+	}
+	if strings.TrimSpace(conv.Title) == "" {
+		conv.Title = "Nova conversa"
+	}
+	now := time.Now().UTC()
+	if conv.CreatedAt.IsZero() {
+		conv.CreatedAt = now
+	}
+	conv.UpdatedAt = now
+
+	meta := conversationMetaLine{
+		Type:      "meta",
+		ID:        conv.ID,
+		Title:     conv.Title,
+		CreatedAt: conv.CreatedAt,
+		UpdatedAt: conv.UpdatedAt,
+	}
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+
+	var sb strings.Builder
+	sb.Write(metaBytes)
+	sb.WriteByte('\n')
+
+	for _, m := range conv.Messages {
+		msgLine, err := json.Marshal(conversationMsgLine{
+			Type:    "message",
+			Message: m,
+		})
+		if err != nil {
+			return err
+		}
+		sb.Write(msgLine)
+		sb.WriteByte('\n')
+	}
+
+	return os.WriteFile(s.filePath(conv.ID), []byte(sb.String()), 0o644)
+}
+
+func (s *ConversationStore) Load(id string) (Conversation, error) {
+	raw, err := os.ReadFile(s.filePath(id))
 	if err != nil {
 		return Conversation{}, err
 	}
-	defer f.Close()
-
-	var c Conversation
-	sc := bufio.NewScanner(f)
+	var conv Conversation
+	sc := bufio.NewScanner(strings.NewReader(string(raw)))
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
-		var probe struct {
+		var header struct {
 			Type string `json:"type"`
 		}
-		if err := json.Unmarshal([]byte(line), &probe); err != nil {
+		if err := json.Unmarshal([]byte(line), &header); err != nil {
 			continue
 		}
-		if probe.Type == "meta" {
-			var h jsonlHeader
-			if json.Unmarshal([]byte(line), &h) == nil {
-				c.ID = h.ID
-				c.Title = h.Title
-				c.UpdatedAt = h.UpdatedAt
+		switch header.Type {
+		case "meta":
+			var m conversationMetaLine
+			if err := json.Unmarshal([]byte(line), &m); err == nil {
+				conv.ID = m.ID
+				conv.Title = m.Title
+				conv.CreatedAt = m.CreatedAt
+				conv.UpdatedAt = m.UpdatedAt
 			}
-		} else if probe.Type == "msg" {
-			var row jsonlMessageRow
-			if json.Unmarshal([]byte(line), &row) == nil {
-				c.Messages = append(c.Messages, row.Message)
+		case "message":
+			var msgLine conversationMsgLine
+			if err := json.Unmarshal([]byte(line), &msgLine); err == nil {
+				conv.Messages = append(conv.Messages, msgLine.Message)
 			}
 		}
 	}
-	return c, sc.Err()
+	if conv.ID == "" {
+		conv.ID = strings.TrimSuffix(filepath.Base(s.filePath(id)), ".jsonl")
+	}
+	if conv.Title == "" {
+		conv.Title = conv.ID
+	}
+	return conv, sc.Err()
 }
 
-func (s *ConversationStore) Save(c Conversation) error {
-	if c.ID == "" {
-		c.ID = time.Now().Format("20060102-150405")
-	}
-	if strings.TrimSpace(c.Title) == "" {
-		c.Title = "Nova Conversa"
-	}
-	c.UpdatedAt = time.Now()
-
-	safeID := filepath.Base(c.ID)
-	f, err := os.Create(filepath.Join(s.dir, safeID+".jsonl"))
+func (s *ConversationStore) List() ([]Conversation, error) {
+	entries, err := os.ReadDir(s.dir)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	defer f.Close()
-
-	enc := json.NewEncoder(f)
-	if err := enc.Encode(jsonlHeader{
-		Type:      "meta",
-		ID:        c.ID,
-		Title:     c.Title,
-		UpdatedAt: c.UpdatedAt,
-	}); err != nil {
-		return err
-	}
-	for _, m := range c.Messages {
-		if err := enc.Encode(jsonlMessageRow{
-			Type:    "msg",
-			Message: m,
-		}); err != nil {
-			return err
+	var list []Conversation
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".jsonl")
+		if conv, err := s.Load(id); err == nil {
+			list = append(list, conv)
 		}
 	}
-	return nil
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].UpdatedAt.After(list[j].UpdatedAt)
+	})
+	return list, nil
 }
 
 func (s *ConversationStore) Rename(id, newTitle string) error {
-	safeID := filepath.Base(id)
-	path := filepath.Join(s.dir, safeID+".jsonl")
-	c, err := s.loadFile(path)
+	conv, err := s.Load(id)
 	if err != nil {
 		return err
 	}
-	c.Title = strings.TrimSpace(newTitle)
-	return s.Save(c)
+	conv.Title = strings.TrimSpace(newTitle)
+	return s.Save(conv)
 }
 
 func (s *ConversationStore) Delete(id string) error {
-	safeID := filepath.Base(id)
-	return os.Remove(filepath.Join(s.dir, safeID+".jsonl"))
+	return os.Remove(s.filePath(id))
 }
