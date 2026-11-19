@@ -1,6 +1,7 @@
 package hardware
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"runtime"
@@ -21,7 +22,7 @@ const (
 	BackendCPU    BackendType = "cpu"
 )
 
-type PrereqIssue struct {
+type Prereq struct {
 	Name        string
 	InstallHint string
 }
@@ -36,231 +37,200 @@ type Info struct {
 	GPUVendor         string
 	VRAMMB            int
 	SelectedBackend   BackendType
-	FallbackBackends  []BackendType
 	Supported         bool
 	UnsupportedReason string
-	MissingPrereqs    []PrereqIssue
-}
-
-type ProbeEnv struct {
-	GOOS          string
-	GOARCH        string
-	HasNvidiaSMI  bool
-	NvidiaGPUName string
-	NvidiaVRAMMB  int
-	HasRocmSMI    bool
-	AmdGPUName    string
-	AmdVRAMMB     int
-	HasIntelGPU   bool
-	HasVulkanLib  bool
-	HasLibGomp    bool
-	VulkanDevice  string
+	MissingPrereqs    []Prereq
 }
 
 func Detect() Info {
-	env := collectProbeEnv()
-	info := Evaluate(env)
-
-	if c, err := cpu.Info(); err == nil && len(c) > 0 {
-		info.CPUName = strings.TrimSpace(c[0].ModelName)
-	}
-	if info.CPUName == "" {
-		info.CPUName = runtime.GOARCH + " CPU"
-	}
-	info.CPUCores = runtime.NumCPU()
-
-	if v, err := mem.VirtualMemory(); err == nil {
-		info.TotalRAMBytes = v.Total
-	}
-	return info
-}
-
-func collectProbeEnv() ProbeEnv {
-	env := ProbeEnv{
-		GOOS:         runtime.GOOS,
-		GOARCH:       runtime.GOARCH,
-		VulkanDevice: os.Getenv("SD_VULKAN_DEVICE"),
-	}
-
-	if out, err := exec.Command("nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits").Output(); err == nil {
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		if len(lines) > 0 && lines[0] != "" {
-			parts := strings.Split(lines[0], ",")
-			env.HasNvidiaSMI = true
-			env.NvidiaGPUName = strings.TrimSpace(parts[0])
-			if len(parts) > 1 {
-				env.NvidiaVRAMMB, _ = strconv.Atoi(strings.TrimSpace(parts[1]))
-			}
-		}
-	}
-
-	if out, err := exec.Command("rocm-smi", "--showproductname").Output(); err == nil && len(out) > 0 {
-		env.HasRocmSMI = true
-		env.AmdGPUName = "AMD Radeon (ROCm)"
-	}
-
-	if runtime.GOOS == "linux" {
-		env.HasVulkanLib = fileExists("/usr/lib/x86_64-linux-gnu/libvulkan.so.1") ||
-			fileExists("/usr/lib/libvulkan.so.1") ||
-			fileExists("/usr/lib/aarch64-linux-gnu/libvulkan.so.1")
-		env.HasLibGomp = fileExists("/usr/lib/x86_64-linux-gnu/libgomp.so.1") ||
-			fileExists("/usr/lib/libgomp.so.1") ||
-			fileExists("/usr/lib/aarch64-linux-gnu/libgomp.so.1")
-		if entries, err := os.ReadDir("/sys/class/drm"); err == nil {
-			for _, e := range entries {
-				if strings.HasPrefix(e.Name(), "card") && !strings.Contains(e.Name(), "-") {
-					data, err := os.ReadFile("/sys/class/drm/" + e.Name() + "/device/vendor")
-					if err == nil {
-						v := strings.TrimSpace(string(data))
-						if v == "0x1002" && env.AmdGPUName == "" {
-							env.AmdGPUName = "AMD Radeon GPU"
-						}
-						if v == "0x8086" {
-							env.HasIntelGPU = true
-						}
-					}
-				}
-			}
-		}
-	} else if runtime.GOOS == "windows" {
-		env.HasVulkanLib = true
-		env.HasLibGomp = true
-		if out, err := exec.Command("wmic", "path", "win32_VideoController", "get", "name").Output(); err == nil {
-			s := strings.ToLower(string(out))
-			if strings.Contains(s, "amd") || strings.Contains(s, "radeon") {
-				env.AmdGPUName = "AMD Radeon Graphics"
-			}
-			if strings.Contains(s, "intel") {
-				env.HasIntelGPU = true
-			}
-		}
-	}
-
-	return env
-}
-
-func Evaluate(env ProbeEnv) Info {
 	info := Info{
-		OS:        env.GOOS,
-		Arch:      env.GOARCH,
-		Supported: true,
+		OS:              runtime.GOOS,
+		Arch:            runtime.GOARCH,
+		CPUName:         "Unknown CPU",
+		CPUCores:        runtime.NumCPU(),
+		GPUName:         "CPU Fallback",
+		GPUVendor:       "none",
+		SelectedBackend: BackendCPU,
+		Supported:       true,
 	}
 
-	switch env.GOOS {
-	case "darwin":
-		if env.GOARCH != "arm64" {
-			info.Supported = false
-			info.UnsupportedReason = "macOS Intel (x86_64) não é suportado. Apenas Macs com Apple Silicon (arm64) possuem suporte Metal."
-			info.GPUVendor = "intel"
-			info.GPUName = "Intel Mac (Não suportado)"
-			info.SelectedBackend = BackendCPU
+	if cpuInfos, err := cpu.Info(); err == nil && len(cpuInfos) > 0 {
+		if name := strings.TrimSpace(cpuInfos[0].ModelName); name != "" {
+			info.CPUName = name
+		}
+	}
+	if vm, err := mem.VirtualMemory(); err == nil && vm != nil {
+		info.TotalRAMBytes = vm.Total
+	}
+
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		info.GPUName = "Apple Silicon GPU"
+		info.GPUVendor = "apple"
+		info.SelectedBackend = BackendMetal
+		if info.TotalRAMBytes > 0 {
+			info.VRAMMB = int(info.TotalRAMBytes / (1024 * 1024))
+		}
+		return info
+	}
+
+	if gpuName, vram, ok := detectNvidiaSMI(); ok {
+		info.GPUName = gpuName
+		info.GPUVendor = "nvidia"
+		info.VRAMMB = vram
+		info.SelectedBackend = BackendCUDA
+		return info
+	}
+
+	if gpuName, vram, ok := detectRocmSMI(); ok {
+		info.GPUName = gpuName
+		info.GPUVendor = "amd"
+		info.VRAMMB = vram
+		info.SelectedBackend = BackendROCm
+		return info
+	}
+
+	if runtime.GOOS == "windows" {
+		if gpuName, vendor, vram, ok := detectWindowsVideoController(); ok {
+			info.GPUName = gpuName
+			info.GPUVendor = vendor
+			info.VRAMMB = vram
+			switch vendor {
+			case "nvidia":
+				info.SelectedBackend = BackendCUDA
+			case "amd", "intel":
+				info.SelectedBackend = BackendVulkan
+			default:
+				info.SelectedBackend = BackendCPU
+			}
 			return info
 		}
-		info.GPUVendor = "apple"
-		info.GPUName = "Apple Silicon GPU (Metal)"
-		info.SelectedBackend = BackendMetal
-		info.FallbackBackends = []BackendType{BackendCPU}
-
-	case "windows":
-		if env.HasNvidiaSMI {
-			info.GPUVendor = "nvidia"
-			info.GPUName = env.NvidiaGPUName
-			info.VRAMMB = env.NvidiaVRAMMB
-			info.SelectedBackend = BackendCUDA
-			info.FallbackBackends = []BackendType{BackendVulkan, BackendCPU}
-		} else if env.AmdGPUName != "" {
-			info.GPUVendor = "amd"
-			info.GPUName = env.AmdGPUName
-			info.SelectedBackend = BackendVulkan
-			info.FallbackBackends = []BackendType{BackendCPU}
-		} else if env.HasIntelGPU {
-			info.GPUVendor = "intel"
-			info.GPUName = "Intel Arc / Integrated Graphics"
-			info.SelectedBackend = BackendVulkan
-			info.FallbackBackends = []BackendType{BackendCPU}
-		} else {
-			info.GPUVendor = "none"
-			info.GPUName = "CPU Fallback"
-			info.SelectedBackend = BackendCPU
-		}
-
-	case "linux":
-		if env.HasNvidiaSMI {
-			info.GPUVendor = "nvidia"
-			info.GPUName = env.NvidiaGPUName
-			info.VRAMMB = env.NvidiaVRAMMB
-			info.SelectedBackend = BackendCUDA
-			info.FallbackBackends = []BackendType{BackendVulkan, BackendCPU}
-		} else if env.HasRocmSMI {
-			info.GPUVendor = "amd"
-			info.GPUName = env.AmdGPUName
-			info.VRAMMB = env.AmdVRAMMB
-			info.SelectedBackend = BackendROCm
-			info.FallbackBackends = []BackendType{BackendVulkan, BackendCPU}
-		} else if env.AmdGPUName != "" {
-			info.GPUVendor = "amd"
-			info.GPUName = env.AmdGPUName
-			info.SelectedBackend = BackendVulkan
-			info.FallbackBackends = []BackendType{BackendCPU}
-		} else if env.HasIntelGPU {
-			info.GPUVendor = "intel"
-			info.GPUName = "Intel Graphics"
-			info.SelectedBackend = BackendVulkan
-			info.FallbackBackends = []BackendType{BackendCPU}
-		} else {
-			info.GPUVendor = "none"
-			info.GPUName = "CPU Only"
-			info.SelectedBackend = BackendCPU
-		}
-
-		if !env.HasLibGomp {
-			info.MissingPrereqs = append(info.MissingPrereqs, PrereqIssue{
-				Name:        "libgomp.so.1",
-				InstallHint: linuxPackageHint("libgomp"),
-			})
-		}
-		if info.SelectedBackend == BackendVulkan && !env.HasVulkanLib {
-			info.MissingPrereqs = append(info.MissingPrereqs, PrereqIssue{
-				Name:        "libvulkan.so.1",
-				InstallHint: linuxPackageHint("vulkan"),
-			})
-		}
-
-	default:
-		info.SelectedBackend = BackendCPU
 	}
 
 	return info
 }
 
-func linuxPackageHint(kind string) string {
-	osRelease, _ := os.ReadFile("/etc/os-release")
-	content := strings.ToLower(string(osRelease))
-	switch {
-	case strings.Contains(content, "ubuntu") || strings.Contains(content, "debian"):
-		if kind == "vulkan" {
-			return "sudo apt update && sudo apt install -y libvulkan1 vulkan-tools"
-		}
-		return "sudo apt update && sudo apt install -y libgomp1"
-	case strings.Contains(content, "fedora") || strings.Contains(content, "rhel"):
-		if kind == "vulkan" {
-			return "sudo dnf install -y vulkan-loader"
-		}
-		return "sudo dnf install -y libgomp"
-	case strings.Contains(content, "arch"):
-		if kind == "vulkan" {
-			return "sudo pacman -S vulkan-icd-loader"
-		}
-		return "sudo pacman -S gcc-libs"
-	default:
-		if kind == "vulkan" {
-			return "Instale o pacote libvulkan / vulkan-icd-loader da sua distribuição"
-		}
-		return "Instale o pacote libgomp / gcc-libs da sua distribuição"
+func FindNvidiaSMI() string {
+	candidates := []string{"nvidia-smi"}
+	if runtime.GOOS == "windows" {
+		candidates = append(candidates,
+			`C:\Windows\System32\nvidia-smi.exe`,
+			`C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe`,
+		)
 	}
+	for _, c := range candidates {
+		if p, err := exec.LookPath(c); err == nil {
+			return p
+		}
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
 }
 
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+func detectNvidiaSMI() (string, int, bool) {
+	bin := FindNvidiaSMI()
+	if bin == "" {
+		return "", 0, false
+	}
+	out, err := exec.Command(bin, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return "", 0, false
+	}
+	line := strings.TrimSpace(strings.Split(string(out), "\n")[0])
+	parts := strings.Split(line, ",")
+	if len(parts) < 2 {
+		return "", 0, false
+	}
+	name := strings.TrimSpace(parts[0])
+	vram, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
+	return name, vram, name != ""
+}
+
+func detectRocmSMI() (string, int, bool) {
+	bin, err := exec.LookPath("rocm-smi")
+	if err != nil {
+		return "", 0, false
+	}
+	out, err := exec.Command(bin, "--showproductname").Output()
+	if err != nil {
+		return "", 0, false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, "Card series:") || strings.Contains(line, "Card model:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				return strings.TrimSpace(parts[1]), 0, true
+			}
+		}
+	}
+	return "", 0, false
+}
+
+func detectWindowsVideoController() (string, string, int, bool) {
+	psCmd := `Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM,AdapterCompatibility | ConvertTo-Json -Compress`
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", psCmd).Output()
+	if err != nil {
+		return "", "", 0, false
+	}
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
+		return "", "", 0, false
+	}
+
+	type winGPU struct {
+		Name                 string `json:"Name"`
+		AdapterRAM           uint64 `json:"AdapterRAM"`
+		AdapterCompatibility string `json:"AdapterCompatibility"`
+	}
+
+	var list []winGPU
+	if strings.HasPrefix(raw, "[") {
+		_ = json.Unmarshal([]byte(raw), &list)
+	} else {
+		var single winGPU
+		if err := json.Unmarshal([]byte(raw), &single); err == nil {
+			list = append(list, single)
+		}
+	}
+
+	var best winGPU
+	bestScore := -1
+	for _, g := range list {
+		name := strings.TrimSpace(g.Name)
+		low := strings.ToLower(name + " " + g.AdapterCompatibility)
+		if name == "" || strings.Contains(low, "microsoft basic") || strings.Contains(low, "virtual") || strings.Contains(low, "parsec") {
+			continue
+		}
+		score := 1
+		if strings.Contains(low, "nvidia") || strings.Contains(low, "geforce") || strings.Contains(low, "rtx") || strings.Contains(low, "gtx") {
+			score = 3
+		} else if strings.Contains(low, "amd") || strings.Contains(low, "radeon") {
+			score = 3
+		} else if strings.Contains(low, "intel") && (strings.Contains(low, "arc") || strings.Contains(low, "iris")) {
+			score = 2
+		}
+		if score > bestScore {
+			bestScore = score
+			best = g
+		}
+	}
+
+	if bestScore < 0 {
+		return "", "", 0, false
+	}
+
+	low := strings.ToLower(best.Name + " " + best.AdapterCompatibility)
+	vendor := "unknown"
+	switch {
+	case strings.Contains(low, "nvidia") || strings.Contains(low, "geforce") || strings.Contains(low, "rtx") || strings.Contains(low, "gtx"):
+		vendor = "nvidia"
+	case strings.Contains(low, "amd") || strings.Contains(low, "radeon") || strings.Contains(low, "advanced micro devices"):
+		vendor = "amd"
+	case strings.Contains(low, "intel"):
+		vendor = "intel"
+	}
+
+	vramMB := int(best.AdapterRAM / (1024 * 1024))
+	return strings.TrimSpace(best.Name), vendor, vramMB, true
 }
