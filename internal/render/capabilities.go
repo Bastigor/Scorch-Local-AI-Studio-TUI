@@ -3,7 +3,6 @@ package render
 import (
 	"os"
 	"strings"
-	"time"
 
 	"golang.org/x/term"
 )
@@ -51,7 +50,6 @@ func DetectCapabilities(forceMode string) Capabilities {
 	if w, h, err := term.GetSize(fd); err == nil && w > 0 && h > 0 {
 		cols, rows = w, h
 	}
-	sixelDA1 := probeSixelDeviceAttributes(fd)
 	return EvaluateCapabilities(TermEnvInput{
 		Term:        os.Getenv("TERM"),
 		TermProgram: os.Getenv("TERM_PROGRAM"),
@@ -61,36 +59,11 @@ func DetectCapabilities(forceMode string) Capabilities {
 		Sty:         os.Getenv("STY"),
 		KittyWindow: os.Getenv("KITTY_WINDOW_ID"),
 		WTProfile:   os.Getenv("WT_SESSION"),
-		SixelDA1:    sixelDA1,
+		SixelDA1:    false,
 		ForceMode:   forceMode,
 		Cols:        cols,
 		Rows:        rows,
 	})
-}
-
-// probeSixelDeviceAttributes consulta Primary Device Attributes (\x1b[c) em modo raw
-// procurando pelo parâmetro ";4;" (indicação padrão DEC de suporte a Sixel).
-func probeSixelDeviceAttributes(fd int) bool {
-	if !term.IsTerminal(fd) {
-		return false
-	}
-	oldState, err := term.MakeRaw(fd)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = term.Restore(fd, oldState) }()
-
-	_, _ = os.Stdout.Write([]byte("\x1b[c"))
-	_ = os.Stdin.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
-	defer func() { _ = os.Stdin.SetReadDeadline(time.Time{}) }()
-
-	buf := make([]byte, 64)
-	n, err := os.Stdin.Read(buf)
-	if err != nil || n == 0 {
-		return false
-	}
-	resp := string(buf[:n])
-	return strings.Contains(resp, ";4;") || strings.Contains(resp, ";4c")
 }
 
 func EvaluateCapabilities(in TermEnvInput) Capabilities {
