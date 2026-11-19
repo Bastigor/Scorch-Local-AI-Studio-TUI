@@ -96,12 +96,12 @@ func main() {
 	convStore := store.NewConversationStore(filepath.Join(dataDir, "conversations"))
 	collector := sysmon.NewCollector()
 
-	appModel := tui.NewAppModel(tui.Dependencies{
+	appModel := tui.NewAppModel(tui.AppDeps{
 		DataDir:    dataDir,
 		Config:     cfg,
 		ConfigPath: filepath.Join(dataDir, "config.toml"),
 		Hardware:   hw,
-		Caps:       caps,
+		TermCaps:   caps,
 		BackendMgr: backendMgr,
 		ModelMgr:   modelMgr,
 		ConvStore:  convStore,
