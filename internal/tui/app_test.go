@@ -5,80 +5,88 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
-
-	"local-ai-studio-tui/internal/backend"
 	"local-ai-studio-tui/internal/hardware"
-	"local-ai-studio-tui/internal/models"
 	"local-ai-studio-tui/internal/render"
 	"local-ai-studio-tui/internal/store"
-	"local-ai-studio-tui/internal/sysmon"
 	"local-ai-studio-tui/internal/tui/theme"
 )
 
-func newTestApp(t *testing.T, ascii, light bool) AppModel {
-	dir := t.TempDir()
-	_ = store.EnsureLayout(dir)
+func newTestAppModel(cols, rows int) AppModel {
 	cfg := store.DefaultConfig()
-	cfg.UI.ASCII = ascii
-	if light {
-		cfg.UI.Theme = "light"
+	caps := render.Capabilities{
+		Cols:               cols,
+		Rows:               rows,
+		ColorDepth:         "truecolor",
+		DetectedImageMode:  render.ProtoBlocks,
+		EffectiveImageMode: render.ProtoBlocks,
 	}
-	hw := hardware.Info{SelectedBackend: hardware.BackendCPU, CPUName: "Test CPU", Supported: true}
-	caps := render.TermEnvInput{Cols: 100, Rows: 30}
-	th := theme.New(light, ascii)
-
+	hw := hardware.Info{
+		OS:              "windows",
+		Arch:            "amd64",
+		GPUName:         "Test GPU",
+		GPUVendor:       "nvidia",
+		SelectedBackend: hardware.BackendCUDA,
+		Supported:       true,
+	}
 	m := NewAppModel(AppDeps{
-		DataDir:    dir,
-		Config:     cfg,
-		Hardware:   hw,
-		TermCaps:   render.EvaluateCapabilities(caps),
-		Theme:      th,
-		BackendMgr: backend.NewManager(dir, hw),
-		ConvStore:  store.NewConversationStore(dir + "/conversations"),
-		ModelMgr:   models.NewManager(dir),
-		SysMon:     sysmon.NewCollector(),
+		DataDir:  ".",
+		Config:   cfg,
+		Hardware: hw,
+		TermCaps: caps,
 	})
+	m.showSplash = false
 	m.showWizard = false
 	return m
 }
 
-func TestAppNavigationAndModes(t *testing.T) {
-	modes := []struct {
-		name  string
-		ascii bool
-		light bool
-	}{
-		{"dark_unicode", false, false},
-		{"light_unicode", false, true},
-		{"dark_ascii", true, false},
-	}
-
-	for _, tc := range modes {
-		t.Run(tc.name, func(t *testing.T) {
-			m := newTestApp(t, tc.ascii, tc.light)
-
-			// Dispensa splash
-			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-			m = updated.(AppModel)
-
-			// Percorre todas as 5 abas verificando renderização não vazia
-			for tab := 1; tab <= 5; tab++ {
-				updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{rune('0' + tab)}, Alt: true})
-				m = updated.(AppModel)
-				out := m.View()
-				if strings.TrimSpace(out) == "" {
-					t.Fatalf("empty view on tab %d", tab)
-				}
-			}
-		})
+func TestAppModelMinimumTerminalSizeGuard(t *testing.T) {
+	m := newTestAppModel(60, 20)
+	out := m.View()
+	if !strings.Contains(out, "80x24") {
+		t.Fatalf("expected minimum size warning containing 80x24, got: %q", out)
 	}
 }
 
-func TestSmallTerminalWarning(t *testing.T) {
-	m := newTestApp(t, true, false)
-	updated, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 18})
-	m = updated.(AppModel)
-	if !strings.Contains(m.View(), "80x24") {
-		t.Fatalf("expected 80x24 warning, got: %s", m.View())
+func TestAppModelTabNavigation(t *testing.T) {
+	m := newTestAppModel(100, 30)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'2'}})
+	am := updated.(AppModel)
+	if am.activeTab != TabImages {
+		t.Fatalf("expected TabImages, got %v", am.activeTab)
+	}
+
+	updated, _ = am.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	am = updated.(AppModel)
+	if am.activeTab != TabModels {
+		t.Fatalf("expected TabModels, got %v", am.activeTab)
+	}
+
+	updated, _ = am.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'4'}})
+	am = updated.(AppModel)
+	if am.activeTab != TabMonitor {
+		t.Fatalf("expected TabMonitor, got %v", am.activeTab)
+	}
+
+	updated, _ = am.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	am = updated.(AppModel)
+	if am.activeTab != TabLogs {
+		t.Fatalf("expected TabLogs, got %v", am.activeTab)
+	}
+}
+
+func TestThemePaletteVariants(t *testing.T) {
+	pDark := theme.PaletteFor("dark", "truecolor", false)
+	pLight := theme.PaletteFor("light", "truecolor", false)
+	pNoColor := theme.PaletteFor("dark", "none", true)
+
+	if pDark.ActiveTab.Render("Chat") == "" {
+		t.Fatal("expected non-empty rendered tab in dark palette")
+	}
+	if pLight.Error.Render("Erro") == "" {
+		t.Fatal("expected non-empty rendered error in light palette")
+	}
+	if pNoColor.Muted.Render("Status") != "Status" {
+		t.Fatalf("expected plain text in no-color palette, got %q", pNoColor.Muted.Render("Status"))
 	}
 }
