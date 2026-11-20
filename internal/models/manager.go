@@ -1,7 +1,6 @@
 package models
 
 import (
-	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -55,14 +53,21 @@ type DownloadProgress struct {
 	Err        error
 }
 
-type BinaryRelease struct {
-	Name   string
-	URL    string
-	SHA256 string
-}
-
 type Manager struct {
 	dataDir string
+}
+
+var stallTimeout = 45 * time.Second
+
+// downloadClient não tem timeout total (arquivos grandes), mas limita a
+// conexão e a espera pelos cabeçalhos para não ficar pendurado.
+var downloadClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	},
 }
 
 func NewManager(dataDir string) *Manager {
@@ -96,125 +101,6 @@ func DefaultCatalog() []CatalogItem {
 			SizeHuman: "3.46 GB",
 			URL:       "https://huggingface.co/stabilityai/sd-turbo/resolve/main/sd_turbo.safetensors",
 		},
-	}
-}
-
-type githubReleaseResponse struct {
-	Assets []struct {
-		Name               string `json:"name"`
-		BrowserDownloadURL string `json:"browser_download_url"`
-	} `json:"assets"`
-}
-
-func resolveLatestGitHubAsset(repo string, keywords []string, fallbackURL string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-	defer cancel()
-
-	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	if err != nil {
-		return fallbackURL
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "local-ai-studio-tui")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fallbackURL
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fallbackURL
-	}
-
-	var rel githubReleaseResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
-		return fallbackURL
-	}
-
-	for _, asset := range rel.Assets {
-		low := strings.ToLower(asset.Name)
-		if !strings.HasSuffix(low, ".zip") {
-			continue
-		}
-		matched := true
-		for _, kw := range keywords {
-			if !strings.Contains(low, strings.ToLower(kw)) {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			return asset.BrowserDownloadURL
-		}
-	}
-	return fallbackURL
-}
-
-func DefaultBackendReleases(backend string) []BinaryRelease {
-	switch runtime.GOOS {
-	case "windows":
-		llamaKW := []string{"bin-win", "cpu", "x64"}
-		sdKW := []string{"bin-win", "avx2", "x64"}
-		llamaFallback := "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-win-avx2-x64.zip"
-		sdFallback := "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-win-avx2-x64.zip"
-
-		if backend == "cuda" {
-			llamaKW = []string{"bin-win", "cuda", "x64"}
-			sdKW = []string{"bin-win", "cuda", "x64"}
-			llamaFallback = "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-win-cuda-cu12.4-x64.zip"
-			sdFallback = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-win-cuda12-x64.zip"
-		} else if backend == "vulkan" {
-			llamaKW = []string{"bin-win", "vulkan", "x64"}
-			sdKW = []string{"bin-win", "vulkan", "x64"}
-			llamaFallback = "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-win-vulkan-x64.zip"
-			sdFallback = "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-win-vulkan-x64.zip"
-		}
-
-		llamaURL := resolveLatestGitHubAsset("ggml-org/llama.cpp", llamaKW, "")
-		if llamaURL == "" {
-			llamaURL = resolveLatestGitHubAsset("ggml-org/llama.cpp", []string{"bin-win", "avx2", "x64"}, llamaFallback)
-		}
-		sdURL := resolveLatestGitHubAsset("leejet/stable-diffusion.cpp", sdKW, "")
-		if sdURL == "" {
-			sdURL = resolveLatestGitHubAsset("leejet/stable-diffusion.cpp", []string{"bin-win", "avx2", "x64"}, sdFallback)
-		}
-
-		return []BinaryRelease{
-			{Name: "llama-server.exe", URL: llamaURL},
-			{Name: "sd.exe", URL: sdURL},
-		}
-	case "darwin":
-		return []BinaryRelease{
-			{
-				Name: "llama-server",
-				URL:  resolveLatestGitHubAsset("ggml-org/llama.cpp", []string{"bin-macos", "arm64"}, "https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-macos-arm64.zip"),
-			},
-			{
-				Name: "sd",
-				URL:  resolveLatestGitHubAsset("leejet/stable-diffusion.cpp", []string{"darwin", "arm64"}, "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-Darwin-arm64.zip"),
-			},
-		}
-	default:
-		arch := "x64"
-		if runtime.GOARCH == "arm64" {
-			arch = "arm64"
-		}
-		llamaKW := []string{"bin-ubuntu", arch}
-		if backend == "vulkan" && arch == "x64" {
-			llamaKW = []string{"bin-ubuntu", "vulkan", "x64"}
-		}
-		return []BinaryRelease{
-			{
-				Name: "llama-server",
-				URL:  resolveLatestGitHubAsset("ggml-org/llama.cpp", llamaKW, fmt.Sprintf("https://github.com/ggml-org/llama.cpp/releases/download/b4831/llama-b4831-bin-ubuntu-%s.zip", arch)),
-			},
-			{
-				Name: "sd",
-				URL:  resolveLatestGitHubAsset("leejet/stable-diffusion.cpp", []string{"linux", arch}, fmt.Sprintf("https://github.com/leejet/stable-diffusion.cpp/releases/download/master-312-90784e5/sd-master-90784e5-bin-Linux-Ubuntu-%s.zip", arch)),
-			},
-		}
 	}
 }
 
@@ -275,6 +161,12 @@ func SafeResolveUnder(baseDir, userRelPath string) (string, error) {
 	}
 	if realBase, err := filepath.EvalSymlinks(cleanBase); err == nil {
 		cleanBase = realBase
+	}
+
+	// Rejeita explicitamente tentativas de sair do diretório base (../).
+	if rel0, relErr := filepath.Rel(cleanBase, filepath.Join(cleanBase, userRelPath)); relErr != nil ||
+		rel0 == ".." || strings.HasPrefix(rel0, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("acesso negado: tentativa de path traversal detectada (%s)", userRelPath)
 	}
 
 	target := filepath.Join(cleanBase, filepath.Clean("/"+userRelPath))
@@ -385,6 +277,41 @@ func (m *Manager) ListInstalled() ([]InstalledModel, error) {
 	return out, nil
 }
 
+// CatalogItemPath devolve o caminho final do arquivo de um item do catálogo.
+func (m *Manager) CatalogItemPath(item CatalogItem) string {
+	subDir := "llm"
+	if item.Kind == KindCheckpoint {
+		subDir = "checkpoints"
+	}
+	p, err := SafeResolveUnder(filepath.Join(m.dataDir, "models", subDir), item.Filename)
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
+// IsInstalled informa se o item do catálogo já existe em disco (e o caminho dele).
+func (m *Manager) IsInstalled(item CatalogItem) (string, bool) {
+	p := m.CatalogItemPath(item)
+	if p == "" {
+		return "", false
+	}
+	if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Size() > 0 {
+		return p, true
+	}
+	return p, false
+}
+
+// HasPartial informa se há um download incompleto (.part) que pode ser retomado.
+func (m *Manager) HasPartial(item CatalogItem) bool {
+	p := m.CatalogItemPath(item)
+	if p == "" {
+		return false
+	}
+	st, err := os.Stat(p + ".part")
+	return err == nil && st.Size() > 0
+}
+
 func (m *Manager) RenameModel(oldPath, newName string) error {
 	dir := filepath.Dir(oldPath)
 	dest, err := SafeResolveUnder(dir, newName)
@@ -425,6 +352,14 @@ func (m *Manager) DownloadWithResume(ctx context.Context, item CatalogItem, onPr
 	}
 	partPath := finalPath + ".part"
 
+	// Já baixado em uma sessão anterior: não baixa de novo.
+	if st, statErr := os.Stat(finalPath); statErr == nil && !st.IsDir() && st.Size() > 0 {
+		if onProgress != nil {
+			onProgress(DownloadProgress{ID: item.ID, Name: item.Name, Downloaded: st.Size(), Total: st.Size()})
+		}
+		return nil
+	}
+
 	err = m.downloadFileRaw(ctx, item.URL, partPath, item.SHA256, func(downloaded, total int64, bps float64, eta int) {
 		if onProgress != nil {
 			onProgress(DownloadProgress{
@@ -443,31 +378,6 @@ func (m *Manager) DownloadWithResume(ctx context.Context, item CatalogItem, onPr
 	return os.Rename(partPath, finalPath)
 }
 
-func (m *Manager) InstallBackendBinaries(ctx context.Context, backend string, onStatus func(string)) error {
-	binDir := filepath.Join(m.dataDir, "bin")
-	cacheDir := filepath.Join(m.dataDir, "cache")
-	_ = os.MkdirAll(binDir, 0o755)
-	_ = os.MkdirAll(cacheDir, 0o755)
-
-	for _, rel := range DefaultBackendReleases(backend) {
-		if onStatus != nil {
-			onStatus(fmt.Sprintf("Baixando %s...", rel.Name))
-		}
-		zipPath := filepath.Join(cacheDir, rel.Name+".zip")
-		_ = os.Remove(zipPath)
-		if err := m.downloadFileRaw(ctx, rel.URL, zipPath, rel.SHA256, nil); err != nil {
-			return fmt.Errorf("falha ao baixar %s: %w", rel.Name, err)
-		}
-		if onStatus != nil {
-			onStatus(fmt.Sprintf("Extraindo %s...", rel.Name))
-		}
-		if err := extractBinaryFromZip(zipPath, binDir, rel.Name); err != nil {
-			return fmt.Errorf("falha ao extrair %s: %w", rel.Name, err)
-		}
-	}
-	return nil
-}
-
 func (m *Manager) downloadFileRaw(ctx context.Context, rawURL, destPath, expectedSHA string, onTick func(downloaded, total int64, bps float64, eta int)) error {
 	for attempt := 0; attempt < 2; attempt++ {
 		var existing int64
@@ -484,7 +394,7 @@ func (m *Manager) downloadFileRaw(ctx context.Context, rawURL, destPath, expecte
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", existing))
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := downloadClient.Do(req)
 		if err != nil {
 			return err
 		}
@@ -515,24 +425,44 @@ func (m *Manager) downloadFileRaw(ctx context.Context, rawURL, destPath, expecte
 		}
 
 		total := existing + resp.ContentLength
+		if resp.ContentLength < 0 {
+			total = 0
+		}
 		downloaded := existing
 		start := time.Now()
 		lastEmit := time.Now()
 		buf := make([]byte, 64*1024)
 
+		// Cancela a conexão se ficar parada por muito tempo sem receber bytes.
+		stallCtx, stallCancel := context.WithCancel(ctx)
+		stall := time.AfterFunc(stallTimeout, stallCancel)
+		go func(body io.Closer) {
+			<-stallCtx.Done()
+			_ = body.Close()
+		}(resp.Body)
+
+		if onTick != nil {
+			onTick(downloaded, total, 0, 0)
+		}
+
 		for {
 			select {
 			case <-ctx.Done():
+				stall.Stop()
+				stallCancel()
 				_ = f.Close()
-				_ = resp.Body.Close()
 				return ctx.Err()
 			default:
 			}
 			n, readErr := resp.Body.Read(buf)
 			if n > 0 {
+				stall.Reset(stallTimeout)
+			}
+			if n > 0 {
 				if _, wErr := f.Write(buf[:n]); wErr != nil {
+					stall.Stop()
+					stallCancel()
 					_ = f.Close()
-					_ = resp.Body.Close()
 					return wErr
 				}
 				downloaded += int64(n)
@@ -554,13 +484,18 @@ func (m *Manager) downloadFileRaw(ctx context.Context, rawURL, destPath, expecte
 				break
 			}
 			if readErr != nil {
+				stall.Stop()
+				stallCancel()
 				_ = f.Close()
-				_ = resp.Body.Close()
+				if ctx.Err() == nil && stallCtx.Err() != nil {
+					return fmt.Errorf("download parado: nenhum dado recebido por %s", stallTimeout)
+				}
 				return readErr
 			}
 		}
+		stall.Stop()
+		stallCancel()
 		_ = f.Close()
-		_ = resp.Body.Close()
 
 		if expectedSHA != "" {
 			if err := VerifySHA256(destPath, expectedSHA); err != nil {
@@ -570,54 +505,6 @@ func (m *Manager) downloadFileRaw(ctx context.Context, rawURL, destPath, expecte
 		return nil
 	}
 	return fmt.Errorf("falha após tentativa de retomada")
-}
-
-func extractBinaryFromZip(zipPath, destDir, targetBin string) error {
-	r, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	found := false
-	for _, f := range r.File {
-		if f.FileInfo().IsDir() {
-			continue
-		}
-		base := filepath.Base(f.Name)
-		isTarget := strings.EqualFold(base, targetBin)
-		isRuntimeLib := strings.HasSuffix(base, ".dll") || strings.Contains(base, ".so") ||
-			strings.HasSuffix(base, ".dylib") || strings.HasSuffix(base, ".metal")
-		if !isTarget && !isRuntimeLib {
-			continue
-		}
-		destPath, err := SafeResolveUnder(destDir, base)
-		if err != nil {
-			continue
-		}
-		rc, err := f.Open()
-		if err != nil {
-			return err
-		}
-		out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
-		if err != nil {
-			_ = rc.Close()
-			return err
-		}
-		_, copyErr := io.Copy(out, rc)
-		_ = out.Close()
-		_ = rc.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		if isTarget {
-			found = true
-		}
-	}
-	if !found {
-		return fmt.Errorf("executável %s não encontrado dentro do pacote %s", targetBin, filepath.Base(zipPath))
-	}
-	return nil
 }
 
 func VerifySHA256(path, expectedHex string) error {

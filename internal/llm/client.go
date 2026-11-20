@@ -27,8 +27,13 @@ type ChatParams struct {
 
 type StreamChunk struct {
 	Delta string
-	Done  bool
-	Err   error
+	// Reasoning traz o "pensamento" de modelos de raciocínio (Qwen3, DeepSeek-R1...),
+	// que o llama-server envia em reasoning_content, separado da resposta final.
+	Reasoning string
+	// Status é uma mensagem de andamento (ex.: "carregando modelo..."), sem texto da resposta.
+	Status string
+	Done   bool
+	Err    error
 }
 
 func StreamChatCompletion(ctx context.Context, endpoint string, systemPrompt string, history []Message, params ChatParams, out chan<- StreamChunk) {
@@ -103,6 +108,7 @@ func StreamChatCompletion(ctx context.Context, endpoint string, systemPrompt str
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
@@ -111,11 +117,14 @@ func StreamChatCompletion(ctx context.Context, endpoint string, systemPrompt str
 		default:
 		}
 
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
 		if data == "[DONE]" {
 			out <- StreamChunk{Done: true}
 			return
@@ -124,14 +133,33 @@ func StreamChatCompletion(ctx context.Context, endpoint string, systemPrompt str
 		var parsed struct {
 			Choices []struct {
 				Delta struct {
-					Content string `json:"content"`
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					Reasoning        string `json:"reasoning"`
 				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
 			} `json:"choices"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
 		}
-		if err := json.Unmarshal([]byte(data), &parsed); err == nil {
-			if len(parsed.Choices) > 0 && parsed.Choices[0].Delta.Content != "" {
-				out <- StreamChunk{Delta: parsed.Choices[0].Delta.Content}
-			}
+		if err := json.Unmarshal([]byte(data), &parsed); err != nil {
+			continue
+		}
+		if parsed.Error != nil && parsed.Error.Message != "" {
+			out <- StreamChunk{Err: fmt.Errorf("servidor: %s", parsed.Error.Message), Done: true}
+			return
+		}
+		if len(parsed.Choices) == 0 {
+			continue
+		}
+		d := parsed.Choices[0].Delta
+		reasoning := d.ReasoningContent
+		if reasoning == "" {
+			reasoning = d.Reasoning
+		}
+		if d.Content != "" || reasoning != "" {
+			out <- StreamChunk{Delta: d.Content, Reasoning: reasoning}
 		}
 	}
 

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,7 +15,6 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
-	"github.com/charmbracelet/lipgloss"
 	"local-ai-studio-tui/internal/backend"
 	"local-ai-studio-tui/internal/hardware"
 	"local-ai-studio-tui/internal/imagegen"
@@ -66,9 +66,16 @@ type downloadStartedMsg struct {
 	ch     chan models.DownloadProgress
 	cancel context.CancelFunc
 }
-type wizardDoneMsg struct {
-	err error
+type wizardEvent struct {
+	status string
+	done   bool
+	err    error
 }
+type wizardStartedMsg struct {
+	ch     chan wizardEvent
+	cancel context.CancelFunc
+}
+type wizardEventMsg wizardEvent
 
 type AppModel struct {
 	deps        AppDeps
@@ -79,6 +86,8 @@ type AppModel struct {
 	showWizard  bool
 	wizardBusy  bool
 	wizardNote  string
+	wizardCh    chan wizardEvent
+	wizardStop  context.CancelFunc
 	showHelp    bool
 	confirmQuit bool
 
@@ -109,12 +118,16 @@ type AppModel struct {
 	streaming     bool
 	streamCh      chan llm.StreamChunk
 	streamCancel  context.CancelFunc
-	streamBuf     strings.Builder
+	streamBuf     *strings.Builder
+	reasonBuf     *strings.Builder
+	chatStatus    string
 	dirtyRender   bool
+	md            *mdCache
 
 	// Images state
 	imgInputs     []textinput.Model
 	imgFocusIdx   int
+	imgEditing    bool
 	imgGenerating bool
 	imgProgress   float64
 	imgCancel     context.CancelFunc
@@ -149,6 +162,7 @@ func NewAppModel(deps AppDeps) AppModel {
 	ta.Focus()
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
+	ta.Prompt = ""
 
 	vp := viewport.New(76, 12)
 	logVp := viewport.New(76, 16)
@@ -184,7 +198,8 @@ func NewAppModel(deps AppDeps) AppModel {
 		ti.SetValue(defaults[i])
 		imgFields[i] = ti
 	}
-	imgFields[0].Focus()
+	// Os campos começam sem foco de edição: os números 1..5 trocam de aba
+	// até o usuário pressionar Enter/i para editar um campo.
 
 	impIn := textinput.New()
 	impIn.Placeholder = "Cole o caminho local (.gguf ou .safetensors) e pressione Enter..."
@@ -205,15 +220,7 @@ func NewAppModel(deps AppDeps) AppModel {
 		gal, _ = imagegen.ListGallery(filepath.Join(deps.DataDir, "outputs"))
 	}
 
-	var selLLM, selSD string
-	for _, im := range inst {
-		if im.Kind == models.KindLLM && selLLM == "" {
-			selLLM = im.Path
-		}
-		if im.Kind == models.KindCheckpoint && selSD == "" {
-			selSD = im.Path
-		}
-	}
+	selLLM, selSD := loadSelection(deps.DataDir, inst)
 
 	activeConv := store.Conversation{
 		ID:    time.Now().Format("20060102-150405"),
@@ -263,6 +270,9 @@ func NewAppModel(deps AppDeps) AppModel {
 		selectedLLM:    selLLM,
 		selectedSD:     selSD,
 		importInput:    impIn,
+		streamBuf:      &strings.Builder{},
+		reasonBuf:      &strings.Builder{},
+		md:             &mdCache{},
 		downloads:      make(map[string]models.DownloadProgress),
 		downloadChans:  make(map[string]chan models.DownloadProgress),
 		downloadCancel: make(map[string]context.CancelFunc),
@@ -270,6 +280,7 @@ func NewAppModel(deps AppDeps) AppModel {
 		logViewport:    logVp,
 	}
 	if deps.SysMon != nil {
+		deps.SysMon.SetFallbackVRAMTotal(deps.Hardware.VRAMMB)
 		m.metrics = deps.SysMon.Sample()
 	}
 	m.resizeViewports()
@@ -313,24 +324,42 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitNextStreamChunk(msg.ch)
 
 	case streamChunkMsg:
+		if msg.Status != "" {
+			m.chatStatus = msg.Status
+			m.statusMsg = msg.Status
+			m.refreshChatViewport(true)
+			return m, waitNextStreamChunk(m.streamCh)
+		}
 		if msg.Err != nil {
 			m.streaming = false
 			m.scorchState = theme.ScorchError
 			m.errMsg = msg.Err.Error()
+			m.chatStatus = ""
+			m.streamBuf.Reset()
+			m.reasonBuf.Reset()
 			m.refreshChatViewport(true)
 			return m, nil
 		}
+		if msg.Reasoning != "" {
+			m.reasonBuf.WriteString(msg.Reasoning)
+			m.chatStatus = "O modelo está raciocinando..."
+			m.refreshChatViewport(true)
+		}
 		if msg.Delta != "" {
 			m.streamBuf.WriteString(msg.Delta)
-			m.dirtyRender = true
 			m.refreshChatViewport(true)
 		}
 		if msg.Done {
 			m.streaming = false
-			m.scorchState = theme.ScorchSuccess
+			m.chatStatus = ""
+			m.statusMsg = ""
+			m.streamCancel = nil
 			finalText := m.streamBuf.String()
+			hadReasoning := m.reasonBuf.Len() > 0
 			m.streamBuf.Reset()
+			m.reasonBuf.Reset()
 			if strings.TrimSpace(finalText) != "" {
+				m.scorchState = theme.ScorchSuccess
 				m.activeConv.Messages = append(m.activeConv.Messages, llm.Message{
 					Role:    "assistant",
 					Content: finalText,
@@ -338,6 +367,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.deps.ConvStore != nil {
 					_ = m.deps.ConvStore.Save(m.activeConv)
 					m.conversations, _ = m.deps.ConvStore.List()
+				}
+			} else {
+				// Antes a resposta vazia era descartada em silêncio.
+				m.scorchState = theme.ScorchError
+				if hadReasoning {
+					m.errMsg = "O modelo gastou todos os tokens raciocinando e não escreveu a resposta. Aumente Max Tokens (Ctrl+P) ou use um modelo sem modo de raciocínio."
+				} else {
+					m.errMsg = "O modelo não retornou texto. Veja a aba [5] Logs para detalhes do llama-server."
 				}
 			}
 			m.refreshChatViewport(true)
@@ -391,6 +428,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.selectedSD = im.Path
 					}
 				}
+				m.persistSelection()
 				m.statusMsg = "Download concluído: " + msg.Name
 			}
 			return m, nil
@@ -400,18 +438,36 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case wizardDoneMsg:
+	case wizardStartedMsg:
+		m.wizardCh = msg.ch
+		m.wizardStop = msg.cancel
+		return m, waitWizardEvent(msg.ch)
+
+	case wizardEventMsg:
+		if msg.status != "" {
+			m.wizardNote = msg.status
+		}
+		if !msg.done {
+			return m, waitWizardEvent(m.wizardCh)
+		}
 		m.wizardBusy = false
+		m.wizardCh = nil
+		m.wizardStop = nil
 		if msg.err != nil {
-			m.wizardNote = "Falha ao baixar binários: " + msg.err.Error()
+			m.wizardNote = "Falha ao baixar binários: " + msg.err.Error() + "  —  Enter tenta de novo, Esc pula."
 		} else {
 			m.showWizard = false
+			m.errMsg = ""
 			m.statusMsg = "Binários instalados com sucesso."
 		}
 		return m, nil
 
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		mm, cmd := m.handleKey(msg)
+		if p, ok := mm.(*AppModel); ok {
+			return *p, cmd
+		}
+		return mm, cmd
 	}
 
 	var cmd tea.Cmd
@@ -422,30 +478,32 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *AppModel) resizeViewports() {
-	sidebarW := 0
-	if m.chatSidebar && m.width >= 100 {
-		sidebarW = 28
-	}
-	w := m.width - sidebarW - 6
-	if w < 40 {
-		w = 40
-	}
-	h := m.height - 14
-	if h < 6 {
-		h = 6
-	}
-	m.chatViewport.Width = w
-	m.chatViewport.Height = h
-	m.logViewport.Width = m.width - 6
-	m.logViewport.Height = h
+	d := m.chatLayout()
+	m.chatViewport.Width = d.vpW
+	m.chatViewport.Height = d.vpH
+	m.chatInput.SetWidth(maxInt(10, d.mainW-4))
+
+	bh := m.bodyHeight()
+	m.logViewport.Width = maxInt(10, m.width-4)
+	m.logViewport.Height = maxInt(3, bh-2-1)
 }
 
 func (m *AppModel) switchTab(tab TabID) {
 	m.activeTab = tab
+	// Sai do modo de edição dos formulários ao trocar de aba.
+	m.stopImageEditing()
 	if tab == TabMonitor && m.deps.SysMon != nil {
 		m.metrics = m.deps.SysMon.Sample()
 	} else if tab == TabLogs {
 		m.refreshLogViewport()
+	}
+	m.resizeViewports()
+}
+
+func (m *AppModel) stopImageEditing() {
+	m.imgEditing = false
+	for i := range m.imgInputs {
+		m.imgInputs[i].Blur()
 	}
 }
 
@@ -462,16 +520,32 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.showWizard {
 		switch key {
 		case "esc":
+			if m.wizardStop != nil {
+				m.wizardStop()
+			}
 			m.showWizard = false
+			m.wizardBusy = false
+			m.statusMsg = "Download de binários cancelado. Pressione Ctrl+B para baixar depois."
 		case "enter":
 			if !m.wizardBusy && m.deps.ModelMgr != nil {
 				m.wizardBusy = true
-				m.wizardNote = "Baixando binários do backend (llama-server e sd)..."
+				m.wizardNote = "Preparando download dos binários do backend (llama-server e sd)..."
 				backendName := string(m.deps.Hardware.SelectedBackend)
 				mgr := m.deps.ModelMgr
 				return m, func() tea.Msg {
-					err := mgr.InstallBackendBinaries(context.Background(), backendName, nil)
-					return wizardDoneMsg{err: err}
+					ctx, cancel := context.WithCancel(context.Background())
+					ch := make(chan wizardEvent, 64)
+					go func() {
+						err := mgr.InstallBackendBinaries(ctx, backendName, func(s string) {
+							select {
+							case ch <- wizardEvent{status: s}:
+							default: // descarta atualizações antigas se a interface estiver atrasada
+							}
+						})
+						ch <- wizardEvent{done: true, err: err}
+						close(ch)
+					}()
+					return wizardStartedMsg{ch: ch, cancel: cancel}
 				}
 			}
 		}
@@ -503,11 +577,37 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Alt+1..5 sempre troca de aba, mesmo com um campo de texto em edição.
+	switch key {
+	case "alt+1":
+		m.switchTab(TabChat)
+		return m, nil
+	case "alt+2":
+		m.switchTab(TabImages)
+		return m, nil
+	case "alt+3":
+		m.switchTab(TabModels)
+		return m, nil
+	case "alt+4":
+		m.switchTab(TabMonitor)
+		return m, nil
+	case "alt+5":
+		m.switchTab(TabLogs)
+		return m, nil
+	case "ctrl+b":
+		m.showWizard = true
+		m.wizardNote = fmt.Sprintf("CPU: %s | GPU: %s (%s). Pressione Enter para baixar os binários ou Esc para pular.",
+			m.deps.Hardware.CPUName, m.deps.Hardware.GPUName, m.deps.Hardware.SelectedBackend)
+		return m, nil
+	}
+
 	inModalInput := m.activeTab == TabChat && (m.chatParams || m.renamingConv || m.attachingImg)
 	chatInputEmpty := m.activeTab == TabChat && !inModalInput && strings.TrimSpace(m.chatInput.Value()) == ""
 
+	// Nas abas de formulário, os números só são tratados como texto enquanto
+	// um campo está realmente em edição (imgEditing / importingMode).
 	canNavigateGlobal := !inModalInput && (m.activeTab != TabChat || !m.chatFocused || chatInputEmpty) &&
-		!(m.activeTab == TabImages && m.imgFocusIdx < len(m.imgInputs)) &&
+		!(m.activeTab == TabImages && m.imgEditing) &&
 		!(m.activeTab == TabModels && m.importingMode)
 
 	if canNavigateGlobal {
@@ -541,7 +641,9 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch m.activeTab {
 	case TabChat:
-		return m.handleChatKey(msg)
+		mm, cmd := m.handleChatKey(msg)
+		m.resizeViewports() // painéis de parâmetros/renomear/anexar mudam a altura do chat
+		return mm, cmd
 	case TabImages:
 		return m.handleImagesKey(msg)
 	case TabModels:
@@ -716,8 +818,12 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.streaming && m.streamCancel != nil {
 			m.streamCancel()
 			m.streaming = false
+			m.chatStatus = ""
+			m.streamBuf.Reset()
+			m.reasonBuf.Reset()
 			m.scorchState = theme.ScorchIdle
 			m.statusMsg = "Geração interrompida pelo usuário."
+			m.refreshChatViewport(true)
 		}
 		return m, nil
 	case "enter":
@@ -756,9 +862,12 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			_ = m.deps.ConvStore.Save(m.activeConv)
 			m.conversations, _ = m.deps.ConvStore.List()
 		}
-		m.refreshChatViewport(true)
 		m.streaming = true
 		m.streamBuf.Reset()
+		m.reasonBuf.Reset()
+		m.chatStatus = "Preparando o servidor do modelo..."
+		m.statusMsg = m.chatStatus
+		m.refreshChatViewport(true)
 
 		return m, m.startChatStreamCmd()
 	}
@@ -798,24 +907,47 @@ func (m *AppModel) startChatStreamCmd() tea.Cmd {
 	}
 
 	return func() tea.Msg {
-		if backendMgr == nil {
-			return streamChunkMsg{Err: fmt.Errorf("gerenciador de backend indisponível"), Done: true}
-		}
-		if modelPath == "" {
-			return streamChunkMsg{Err: fmt.Errorf("nenhum modelo LLM (.gguf) selecionado na aba [3] Modelos"), Done: true}
-		}
+		ch := make(chan llm.StreamChunk, 64)
 		ctx, cancel := context.WithCancel(context.Background())
-		endpoint, err := backendMgr.StartLlamaServer(ctx, modelPath, mmproj)
-		if err != nil {
-			cancel()
-			return streamChunkMsg{Err: err, Done: true}
+
+		fail := func(err error) {
+			ch <- llm.StreamChunk{Err: err, Done: true}
+			close(ch)
 		}
-		ch := make(chan llm.StreamChunk, 32)
-		go llm.StreamChatCompletion(ctx, endpoint, sysPrompt, history, llm.ChatParams{
-			Temperature: temp,
-			TopP:        topP,
-			MaxTokens:   maxTok,
-		}, ch)
+
+		// O servidor sobe e a requisição acontece em segundo plano; a interface
+		// recebe mensagens de status e nunca fica "muda" enquanto o modelo carrega.
+		go func() {
+			if backendMgr == nil {
+				fail(fmt.Errorf("gerenciador de backend indisponível"))
+				return
+			}
+			if modelPath == "" {
+				fail(fmt.Errorf("nenhum modelo LLM (.gguf) selecionado na aba [3] Modelos"))
+				return
+			}
+			endpoint, err := backendMgr.StartLlamaServer(ctx, modelPath, mmproj, func(s string) {
+				select {
+				case ch <- llm.StreamChunk{Status: s}:
+				default:
+				}
+			})
+			if err != nil {
+				if ctx.Err() != nil {
+					ch <- llm.StreamChunk{Done: true}
+					close(ch)
+					return
+				}
+				fail(err)
+				return
+			}
+			llm.StreamChatCompletion(ctx, endpoint, sysPrompt, history, llm.ChatParams{
+				Temperature: temp,
+				TopP:        topP,
+				MaxTokens:   maxTok,
+			}, ch)
+		}()
+
 		return streamStartedMsg{ch: ch, cancel: cancel}
 	}
 }
@@ -840,29 +972,35 @@ func waitNextDownloadProgress(id string, ch <-chan models.DownloadProgress) tea.
 	}
 }
 
+// imgFocusOrder é a ordem visual dos campos da aba de imagens (o índice 9 é o botão).
+var imgFocusOrder = []int{0, 1, 2, 3, 4, 7, 5, 6, 8, 9}
+
+func indexOfInt(list []int, v int) int {
+	for i, x := range list {
+		if x == v {
+			return i
+		}
+	}
+	return 0
+}
+
 func (m *AppModel) handleImagesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
-	totalFocus := len(m.imgInputs) + 1
+	order := imgFocusOrder
+	pos := indexOfInt(order, m.imgFocusIdx)
 
+	moveTo := func(newPos int) {
+		if m.imgFocusIdx < len(m.imgInputs) {
+			m.imgInputs[m.imgFocusIdx].Blur()
+		}
+		m.imgFocusIdx = order[(newPos+len(order))%len(order)]
+		if m.imgEditing && m.imgFocusIdx < len(m.imgInputs) {
+			m.imgInputs[m.imgFocusIdx].Focus()
+		}
+	}
+
+	// Atalhos válidos nos dois modos.
 	switch key {
-	case "tab", "down":
-		if m.imgFocusIdx < len(m.imgInputs) {
-			m.imgInputs[m.imgFocusIdx].Blur()
-		}
-		m.imgFocusIdx = (m.imgFocusIdx + 1) % totalFocus
-		if m.imgFocusIdx < len(m.imgInputs) {
-			m.imgInputs[m.imgFocusIdx].Focus()
-		}
-		return m, nil
-	case "shift+tab", "up":
-		if m.imgFocusIdx < len(m.imgInputs) {
-			m.imgInputs[m.imgFocusIdx].Blur()
-		}
-		m.imgFocusIdx = (m.imgFocusIdx - 1 + totalFocus) % totalFocus
-		if m.imgFocusIdx < len(m.imgInputs) {
-			m.imgInputs[m.imgFocusIdx].Focus()
-		}
-		return m, nil
 	case "ctrl+x":
 		if m.imgGenerating && m.imgCancel != nil {
 			m.imgCancel()
@@ -876,25 +1014,47 @@ func (m *AppModel) handleImagesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "ctrl+g":
+		m.stopImageEditing()
 		return m.triggerImageGeneration()
-	case "enter":
-		if m.imgFocusIdx == len(m.imgInputs) {
-			return m.triggerImageGeneration()
+	}
+
+	if m.imgEditing {
+		switch key {
+		case "esc", "enter":
+			m.stopImageEditing()
+			m.statusMsg = "Edição concluída. Use 1..5 para trocar de aba."
+			return m, nil
+		case "tab", "down":
+			moveTo(pos + 1)
+			return m, nil
+		case "shift+tab", "up":
+			moveTo(pos - 1)
+			return m, nil
 		}
 		if m.imgFocusIdx < len(m.imgInputs) {
-			m.imgInputs[m.imgFocusIdx].Blur()
-		}
-		m.imgFocusIdx = (m.imgFocusIdx + 1) % totalFocus
-		if m.imgFocusIdx < len(m.imgInputs) {
-			m.imgInputs[m.imgFocusIdx].Focus()
+			var cmd tea.Cmd
+			m.imgInputs[m.imgFocusIdx], cmd = m.imgInputs[m.imgFocusIdx].Update(msg)
+			return m, cmd
 		}
 		return m, nil
 	}
 
-	if m.imgFocusIdx < len(m.imgInputs) {
-		var cmd tea.Cmd
-		m.imgInputs[m.imgFocusIdx], cmd = m.imgInputs[m.imgFocusIdx].Update(msg)
-		return m, cmd
+	// Modo de navegação: nenhum campo captura o teclado.
+	switch key {
+	case "tab", "down", "right", "j":
+		moveTo(pos + 1)
+	case "shift+tab", "up", "left", "k":
+		moveTo(pos - 1)
+	case "enter", "i", "e":
+		if m.imgFocusIdx == len(m.imgInputs) {
+			return m.triggerImageGeneration()
+		}
+		m.imgEditing = true
+		m.imgInputs[m.imgFocusIdx].Focus()
+		m.imgInputs[m.imgFocusIdx].CursorEnd()
+		m.statusMsg = "Editando campo. Enter/Esc para terminar."
+	case "g":
+		return m.triggerImageGeneration()
 	}
 	return m, nil
 }
@@ -994,6 +1154,7 @@ func (m *AppModel) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					} else if inst.Kind == models.KindCheckpoint {
 						m.selectedSD = inst.Path
 					}
+					m.persistSelection()
 				}
 			}
 			return m, nil
@@ -1030,6 +1191,14 @@ func (m *AppModel) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if freed, err := m.deps.ModelMgr.DeleteModel(target.Path); err == nil {
 				m.statusMsg = fmt.Sprintf("Modelo removido (%d MB liberados).", freed/(1024*1024))
 				m.installed, _ = m.deps.ModelMgr.ListInstalled()
+				if m.selectedLLM == target.Path {
+					m.selectedLLM = ""
+				}
+				if m.selectedSD == target.Path {
+					m.selectedSD = ""
+				}
+				m.selectedLLM, m.selectedSD = fillSelection(m.selectedLLM, m.selectedSD, m.installed)
+				m.persistSelection()
 				if m.installedIdx >= len(m.installed) && m.installedIdx > 0 {
 					m.installedIdx--
 				}
@@ -1048,11 +1217,27 @@ func (m *AppModel) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.selectedSD = sel.Path
 					m.statusMsg = "Checkpoint SD ativo: " + sel.Name
 				}
+				m.persistSelection()
 			}
 			return m, nil
 		}
 		if len(m.catalog) > 0 && m.catalogIdx < len(m.catalog) && m.deps.ModelMgr != nil {
 			item := m.catalog[m.catalogIdx]
+
+			// Já baixado em uma sessão anterior: apenas ativa, sem baixar de novo.
+			m.installed, _ = m.deps.ModelMgr.ListInstalled()
+			if im, ok := m.findInstalled(item); ok {
+				if im.Kind == models.KindLLM {
+					m.selectedLLM = im.Path
+				} else {
+					m.selectedSD = im.Path
+				}
+				m.persistSelection()
+				m.errMsg = ""
+				m.statusMsg = "Modelo já instalado, ativado: " + item.Name
+				return m, nil
+			}
+
 			if _, exists := m.downloadCancel[item.ID]; exists {
 				m.statusMsg = "Download já em andamento: " + item.Name
 				return m, nil
@@ -1098,14 +1283,32 @@ func (m *AppModel) refreshChatViewport(scrollBottom bool) {
 		}
 		sb.WriteString(fmt.Sprintf("**%s:** %s\n\n", roleLabel, msg.Content))
 	}
-	if m.streaming && m.streamBuf.Len() > 0 {
-		sb.WriteString(fmt.Sprintf("**Assistente:** %s▌\n", m.streamBuf.String()))
+	if m.streaming {
+		switch {
+		case m.streamBuf.Len() > 0:
+			sb.WriteString(fmt.Sprintf("**Assistente:** %s▌\n", m.streamBuf.String()))
+		case m.reasonBuf.Len() > 0:
+			think := m.reasonBuf.String()
+			if r := []rune(think); len(r) > 500 {
+				think = "…" + string(r[len(r)-500:])
+			}
+			think = strings.ReplaceAll(strings.TrimSpace(think), "\n", "\n> ")
+			sb.WriteString("**Assistente (raciocinando):**\n\n> " + think + "▌\n")
+		default:
+			status := m.chatStatus
+			if status == "" {
+				status = "Aguardando resposta..."
+			}
+			sb.WriteString("*" + status + "*\n")
+		}
+	}
+	style := "dark"
+	if strings.EqualFold(m.deps.Config.UI.Theme, "light") {
+		style = "light"
 	}
 	rendered := sb.String()
-	if r, err := glamour.NewTermRenderer(glamour.WithAutoStyle(), glamour.WithWordWrap(maxInt(40, m.chatViewport.Width-4))); err == nil {
-		if out, err := r.Render(rendered); err == nil {
-			rendered = out
-		}
+	if m.md != nil {
+		rendered = m.md.render(rendered, style, maxInt(20, m.chatViewport.Width-2))
 	}
 	m.chatViewport.SetContent(rendered)
 	if scrollBottom {
@@ -1127,224 +1330,115 @@ func (m *AppModel) refreshLogViewport() {
 	m.logViewport.GotoBottom()
 }
 
-func (m AppModel) View() string {
-	if m.width < 80 || m.height < 24 {
-		return fmt.Sprintf("Terminal muito pequeno (%dx%d). Redimensione para pelo menos 80x24.", m.width, m.height)
+func waitWizardEvent(ch <-chan wizardEvent) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return wizardEventMsg{done: true}
+		}
+		return wizardEventMsg(ev)
 	}
-
-	pal := theme.PaletteFor(m.deps.Config.UI.Theme, m.deps.TermCaps.ColorDepth, m.deps.Config.UI.ASCII)
-
-	if m.showSplash {
-		return lipgloss.NewStyle().Padding(2, 4).Render(
-			fmt.Sprintf("%s\n\nAperte Enter para continuar",
-				pal.Accent.Render("Local AI Studio TUI")),
-		)
-	}
-
-	if m.showWizard {
-		return lipgloss.NewStyle().Padding(2, 4).Render(
-			fmt.Sprintf("%s\n\n%s\n\n%s   [Esc] Pular",
-				pal.Accent.Render("Configuração Inicial de Binários"),
-				m.wizardNote,
-				pal.Selected.Render("[Enter] Baixar binários")),
-		)
-	}
-
-	if m.showHelp {
-		return lipgloss.NewStyle().Padding(2, 4).Render(
-			pal.Accent.Render("Atalhos Principais") + "\n\n" +
-				"1..5: Alternar abas (Chat, Imagens, Modelos, Monitor, Logs)\n" +
-				"Chat: Esc Alterna foco prompt/menus | Ctrl+N Novo chat | Ctrl+H Histórico | Ctrl+↑/↓ Trocar chat | Ctrl+P Parâmetros | Ctrl+R Renomear | Ctrl+A Anexar | Ctrl+Y Copiar | Ctrl+S Parar\n" +
-				"Imagens: ↑/↓/Tab Navegar campos | Ctrl+G Gerar imagem | Ctrl+X Cancelar | Ctrl+O Abrir\n" +
-				"Modelos: ↑/↓ Navegar | Enter Baixar/Selecionar | Tab Alternar lista | i Importar local | d Excluir\n" +
-				"Geral: ? ou F1 Ajuda | Ctrl+C Sair",
-		)
-	}
-
-	if m.confirmQuit {
-		return lipgloss.NewStyle().Padding(2, 4).Render(
-			pal.Selected.Render("Encerrar Local AI Studio e finalizar processos ativos? [y/N]"),
-		)
-	}
-
-	tabs := []string{"[1] Chat", "[2] Imagens", "[3] Modelos", "[4] Monitor", "[5] Logs"}
-	var renderedTabs []string
-	for i, t := range tabs {
-		if TabID(i) == m.activeTab {
-			renderedTabs = append(renderedTabs, pal.ActiveTab.Render(t))
-		} else {
-			renderedTabs = append(renderedTabs, pal.InactiveTab.Render(t))
-		}
-	}
-	header := lipgloss.JoinHorizontal(lipgloss.Left, renderedTabs...)
-
-	var body string
-	switch m.activeTab {
-	case TabChat:
-		toolbar := pal.Muted.Render("[Esc] Foco Menus/Prompt  [Ctrl+N] Novo Chat  [Ctrl+H] Histórico  [Ctrl+↑/↓] Alternar  [Ctrl+P] Parâmetros  [Ctrl+R] Renomear  [Ctrl+A] Anexar  [Ctrl+Y] Copiar")
-		mainChat := fmt.Sprintf("%s\n\n%s", m.chatViewport.View(), m.chatInput.View())
-		if m.renamingConv {
-			mainChat = "Renomear conversa: " + m.renameInput.View() + "\n\n" + mainChat
-		}
-		if m.attachingImg {
-			mainChat = "Anexar imagem: " + m.attachInput.View() + "\n\n" + mainChat
-		}
-		if m.chatParams {
-			pLabels := []string{"System Prompt", "Temperature", "Top-P", "Max Tokens"}
-			pInputs := []textinput.Model{m.systemPrompt, m.tempInput, m.topPInput, m.maxTokInput}
-			var pLines []string
-			pLines = append(pLines, pal.Accent.Render("Parâmetros do Chat (↑/↓/Tab navegar, Esc fechar):"))
-			for i, lbl := range pLabels {
-				prefix := "  "
-				if i == m.paramFocusIdx {
-					prefix = pal.Selected.Render("> ")
-				}
-				pLines = append(pLines, fmt.Sprintf("%s%s: %s", prefix, lbl, pInputs[i].View()))
-			}
-			mainChat = strings.Join(pLines, "\n") + "\n\n" + mainChat
-		}
-
-		if m.chatSidebar && m.width >= 100 {
-			var sideLines []string
-			sideLines = append(sideLines, pal.Selected.Render("+ Novo Chat [Ctrl+N]"))
-			sideLines = append(sideLines, pal.Muted.Render("Conversas Recentes:"))
-			if len(m.conversations) == 0 {
-				sideLines = append(sideLines, pal.Muted.Render("  (nenhuma salva)"))
-			}
-			for i, c := range m.conversations {
-				if i >= 12 {
-					break
-				}
-				title := c.Title
-				if len(title) > 20 {
-					title = title[:20] + "…"
-				}
-				if c.ID == m.activeConv.ID {
-					sideLines = append(sideLines, pal.Selected.Render("> "+title))
-				} else {
-					sideLines = append(sideLines, "  "+title)
-				}
-			}
-			sidebarBox := lipgloss.NewStyle().
-				Width(26).
-				Border(pal.Border).
-				Padding(0, 1).
-				Render(strings.Join(sideLines, "\n"))
-			body = lipgloss.JoinVertical(lipgloss.Left, toolbar, lipgloss.JoinHorizontal(lipgloss.Top, sidebarBox, "  ", mainChat))
-		} else {
-			body = lipgloss.JoinVertical(lipgloss.Left, toolbar, mainChat)
-		}
-
-	case TabImages:
-		fieldLabels := []string{
-			"Prompt",
-			"Negative Prompt",
-			"Passos (Steps)",
-			"CFG Scale",
-			"Seed (-1 aleatório)",
-			"Largura (Width)",
-			"Altura (Height)",
-			"Sampler",
-			"Batch Count",
-		}
-		var formLines []string
-		formLines = append(formLines, pal.Muted.Render("Navegue com ↑/↓ ou Tab • Gere com [Ctrl+G] ou Enter no botão abaixo:"))
-		for i, lbl := range fieldLabels {
-			prefix := "  "
-			labelStyled := lbl
-			if m.imgFocusIdx == i {
-				prefix = pal.Selected.Render("> ")
-				labelStyled = pal.Selected.Render(lbl)
-			}
-			formLines = append(formLines, fmt.Sprintf("%s%s: %s", prefix, labelStyled, m.imgInputs[i].View()))
-		}
-		genBtn := "[ Gerar Imagem ]"
-		if m.imgFocusIdx == len(m.imgInputs) {
-			genBtn = pal.ActiveTab.Render("[ Gerar Imagem ]")
-		} else {
-			genBtn = pal.Selected.Render("[ Gerar Imagem ]")
-		}
-		formLines = append(formLines, "", "  "+genBtn+fmt.Sprintf("   Progresso: %.0f%%", m.imgProgress*100))
-		if m.lastImageView != "" {
-			formLines = append(formLines, "", m.lastImageView)
-		}
-		body = strings.Join(formLines, "\n")
-
-	case TabModels:
-		var lines []string
-		lines = append(lines, "Catálogo disponível ([Enter] baixar, [i] importar local, [Tab] alternar lista):")
-		for idx, item := range m.catalog {
-			isSel := !m.focusInstalled && idx == m.catalogIdx
-			line := fmt.Sprintf("%s (%s)", item.Name, item.SizeHuman)
-			if prog, ok := m.downloads[item.ID]; ok && !prog.Done {
-				pct := 0.0
-				if prog.Total > 0 {
-					pct = float64(prog.Downloaded) * 100 / float64(prog.Total)
-				}
-				line += fmt.Sprintf("  [Baixando: %.1f%% | %.1f MB/s]", pct, prog.SpeedBPS/(1024*1024))
-			}
-			if isSel {
-				lines = append(lines, pal.Selected.Render("> "+line))
-			} else {
-				lines = append(lines, "  "+line)
-			}
-		}
-
-		lines = append(lines, "", fmt.Sprintf("Modelos Instalados (%d) — [Enter] ativar, [d] remover:", len(m.installed)))
-		if len(m.installed) == 0 {
-			lines = append(lines, pal.Muted.Render("  Nenhum modelo instalado ainda."))
-		}
-		for idx, im := range m.installed {
-			isSel := m.focusInstalled && idx == m.installedIdx
-			activeTag := ""
-			if im.Path == m.selectedLLM || im.Path == m.selectedSD {
-				activeTag = " [ATIVO]"
-			}
-			line := fmt.Sprintf("%s [%s]%s", im.Name, im.Kind, activeTag)
-			if isSel {
-				lines = append(lines, pal.Selected.Render("> "+line))
-			} else {
-				lines = append(lines, "  "+line)
-			}
-		}
-
-		if m.importingMode {
-			lines = append(lines, "\nImportar: "+m.importInput.View())
-		}
-		body = strings.Join(lines, "\n")
-
-	case TabMonitor:
-		gpuLabel := m.metrics.GPUSource
-		if gpuLabel == "" {
-			gpuLabel = m.deps.Hardware.GPUName
-		}
-		body = fmt.Sprintf("CPU (%s): %.1f%%\nRAM: %d / %d MB (%.1f%%)\nGPU (%s | Backend: %s): %.1f%% | VRAM: %d / %d MB",
-			m.deps.Hardware.CPUName, m.metrics.CPUPercent,
-			m.metrics.RAMUsedMB, m.metrics.RAMTotalMB, m.metrics.RAMPercent,
-			gpuLabel, m.deps.Hardware.SelectedBackend,
-			m.metrics.GPUPercent, m.metrics.VRAMUsedMB, m.metrics.VRAMTotalMB)
-
-	case TabLogs:
-		body = fmt.Sprintf("Filtro ([f]): %s\n\n%s", m.logFilter, m.logViewport.View())
-	}
-
-	statusLine := m.statusMsg
-	if m.errMsg != "" {
-		statusLine = pal.Error.Render("Erro: " + m.errMsg)
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left,
-		header,
-		"",
-		body,
-		"",
-		pal.Muted.Render(statusLine+"  |  [?] Ajuda  [Ctrl+C] Sair"),
-	)
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+// ---- seleção de modelos persistida entre sessões
+
+type selectionState struct {
+	LLM        string `json:"llm"`
+	Checkpoint string `json:"checkpoint"`
+}
+
+func selectionPath(dataDir string) string {
+	return filepath.Join(dataDir, "state.json")
+}
+
+// loadSelection restaura os modelos ativos da última sessão e, na falta deles,
+// escolhe o primeiro modelo instalado de cada tipo.
+func loadSelection(dataDir string, installed []models.InstalledModel) (llmPath, sdPath string) {
+	var st selectionState
+	if dataDir != "" {
+		if raw, err := os.ReadFile(selectionPath(dataDir)); err == nil {
+			_ = json.Unmarshal(raw, &st)
+		}
 	}
-	return b
+	has := func(path string, kind models.ModelKind) bool {
+		for _, im := range installed {
+			if im.Kind == kind && im.Path == path {
+				return true
+			}
+		}
+		return false
+	}
+	if has(st.LLM, models.KindLLM) {
+		llmPath = st.LLM
+	}
+	if has(st.Checkpoint, models.KindCheckpoint) {
+		sdPath = st.Checkpoint
+	}
+	for _, im := range installed {
+		if im.Kind == models.KindLLM && llmPath == "" {
+			llmPath = im.Path
+		}
+		if im.Kind == models.KindCheckpoint && sdPath == "" {
+			sdPath = im.Path
+		}
+	}
+	return llmPath, sdPath
+}
+
+func (m *AppModel) persistSelection() {
+	if m.deps.DataDir == "" {
+		return
+	}
+	raw, err := json.MarshalIndent(selectionState{LLM: m.selectedLLM, Checkpoint: m.selectedSD}, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(selectionPath(m.deps.DataDir), raw, 0o644)
+}
+
+// mdCache guarda o renderizador Markdown para não recriá-lo a cada trecho recebido.
+type mdCache struct {
+	r     *glamour.TermRenderer
+	width int
+	style string
+}
+
+func (c *mdCache) render(text, style string, width int) string {
+	if c.r == nil || c.width != width || c.style != style {
+		// Estilo fixo: glamour.WithAutoStyle consulta o terminal (OSC 11) em plena
+		// execução do Bubble Tea e pode travar/consumir teclas.
+		r, err := glamour.NewTermRenderer(glamour.WithStandardStyle(style), glamour.WithWordWrap(width))
+		if err != nil {
+			return text
+		}
+		c.r, c.width, c.style = r, width, style
+	}
+	out, err := c.r.Render(text)
+	if err != nil {
+		return text
+	}
+	return out
+}
+
+// findInstalled procura o item do catálogo entre os modelos já instalados (pelo nome do arquivo).
+func (m *AppModel) findInstalled(item models.CatalogItem) (models.InstalledModel, bool) {
+	for _, im := range m.installed {
+		if strings.EqualFold(im.Name, item.Filename) {
+			return im, true
+		}
+	}
+	return models.InstalledModel{}, false
+}
+
+// fillSelection completa seleções vazias com o primeiro modelo instalado de cada tipo.
+func fillSelection(llmPath, sdPath string, installed []models.InstalledModel) (string, string) {
+	for _, im := range installed {
+		if im.Kind == models.KindLLM && llmPath == "" {
+			llmPath = im.Path
+		}
+		if im.Kind == models.KindCheckpoint && sdPath == "" {
+			sdPath = im.Path
+		}
+	}
+	return llmPath, sdPath
 }

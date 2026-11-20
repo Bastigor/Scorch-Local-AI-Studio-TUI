@@ -90,6 +90,7 @@ type Manager struct {
 	activeModel   string
 	activePort    int
 	activeCmd     *exec.Cmd
+	activeDone    chan struct{}
 	activeBackend hardware.BackendType
 	logs          *LogBuffer
 }
@@ -151,9 +152,33 @@ func AllocatePort(preferred int) (int, error) {
 	return addr.Port, nil
 }
 
-func (m *Manager) StartLlamaServer(ctx context.Context, modelPath, mmprojPath string) (string, error) {
+// healthTimeout é o tempo máximo para o llama-server carregar o modelo.
+// Modelos grandes em disco lento podem levar bem mais que alguns segundos.
+var healthTimeout = 240 * time.Second
+
+func processAlive(done chan struct{}) bool {
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
+}
+
+// StartLlamaServer inicia (ou reaproveita) o llama-server para o modelo informado.
+// onStatus, se não nulo, recebe mensagens de andamento.
+func (m *Manager) StartLlamaServer(ctx context.Context, modelPath, mmprojPath string, onStatus func(string)) (string, error) {
+	say := func(format string, args ...any) {
+		if onStatus != nil {
+			onStatus(fmt.Sprintf(format, args...))
+		}
+	}
+
 	m.mu.Lock()
-	if m.activeMode == WorkspaceChat && m.activeModel == modelPath && m.activeCmd != nil && m.activeCmd.Process != nil {
+	if m.activeMode == WorkspaceChat && m.activeModel == modelPath && m.activeCmd != nil && processAlive(m.activeDone) {
 		ep := fmt.Sprintf("http://127.0.0.1:%d", m.activePort)
 		m.mu.Unlock()
 		return ep, nil
@@ -163,7 +188,11 @@ func (m *Manager) StartLlamaServer(ctx context.Context, modelPath, mmprojPath st
 	bin := m.BinaryPath("llama-server")
 	if _, err := os.Stat(bin); err != nil {
 		m.mu.Unlock()
-		return "", fmt.Errorf("binário llama-server não encontrado em %s. Coloque o executável em studio-data/bin/", bin)
+		return "", fmt.Errorf("binário llama-server não encontrado em %s. Reabra o aplicativo para baixar os binários ou copie o executável para essa pasta", bin)
+	}
+	if st, err := os.Stat(modelPath); err != nil || st.IsDir() {
+		m.mu.Unlock()
+		return "", fmt.Errorf("arquivo do modelo não encontrado: %s", modelPath)
 	}
 
 	port, err := AllocatePort(8080)
@@ -172,9 +201,24 @@ func (m *Manager) StartLlamaServer(ctx context.Context, modelPath, mmprojPath st
 		return "", fmt.Errorf("falha ao alocar porta local: %w", err)
 	}
 
-	backendsToTry := append([]hardware.BackendType{m.hw.SelectedBackend}, m.hw.FallbackBackends...)
-	var lastErr error
+	backendsToTry := []hardware.BackendType{m.hw.SelectedBackend}
+	for _, b := range m.hw.FallbackBackends {
+		if b != m.hw.SelectedBackend {
+			backendsToTry = append(backendsToTry, b)
+		}
+	}
+	// Sempre termina tentando CPU puro.
+	hasCPU := false
+	for _, b := range backendsToTry {
+		if b == hardware.BackendCPU {
+			hasCPU = true
+		}
+	}
+	if !hasCPU {
+		backendsToTry = append(backendsToTry, hardware.BackendCPU)
+	}
 
+	var lastErr error
 	for _, b := range backendsToTry {
 		args := []string{
 			"-m", modelPath,
@@ -191,8 +235,14 @@ func (m *Manager) StartLlamaServer(ctx context.Context, modelPath, mmprojPath st
 			args = append(args, "-ngl", "99")
 		}
 
+		say("Iniciando llama-server (%s) e carregando o modelo...", b)
+		m.logs.Append("llama-server", fmt.Sprintf("[studio] %s %s", filepath.Base(bin), strings.Join(args, " ")))
+
 		cmd := exec.Command(bin, args...)
-		m.attachLogPipes("llama-server", cmd)
+		cmd.Dir = filepath.Dir(bin)
+		w := &lineWriter{proc: "llama-server", logs: m.logs}
+		cmd.Stdout = w
+		cmd.Stderr = w
 
 		if err := cmd.Start(); err != nil {
 			lastErr = err
@@ -200,22 +250,42 @@ func (m *Manager) StartLlamaServer(ctx context.Context, modelPath, mmprojPath st
 			continue
 		}
 
+		done := make(chan struct{})
+		var waitErr error
+		go func() {
+			waitErr = cmd.Wait()
+			w.Flush()
+			close(done)
+		}()
+
 		m.activeMode = WorkspaceChat
 		m.activeModel = modelPath
 		m.activePort = port
 		m.activeCmd = cmd
+		m.activeDone = done
 		m.activeBackend = b
 		m.mu.Unlock()
 
 		endpoint := fmt.Sprintf("http://127.0.0.1:%d", port)
-		if err := waitHealthy(ctx, endpoint+"/health", 25*time.Second); err != nil {
-			m.mu.Lock()
-			tail := strings.Join(m.logs.Tail("llama-server", 6), " | ")
-			m.stopLocked()
-			lastErr = fmt.Errorf("llama-server falhou no healthcheck (%s): %v — logs: %s", b, err, tail)
-			continue
+		err := waitHealthy(ctx, endpoint+"/health", healthTimeout, done)
+
+		if err == nil {
+			say("Modelo carregado (%s). Gerando resposta...", b)
+			return endpoint, nil
 		}
-		return endpoint, nil
+
+		m.mu.Lock()
+		tail := strings.Join(m.logs.Tail("llama-server", 8), " | ")
+		exitInfo := ""
+		if !processAlive(done) {
+			exitInfo = fmt.Sprintf(" (processo encerrou: %v)", waitErr)
+		}
+		m.stopLocked()
+		if ctx.Err() != nil {
+			m.mu.Unlock()
+			return "", ctx.Err()
+		}
+		lastErr = fmt.Errorf("llama-server falhou com backend %s%s: %v — últimos logs: %s", b, exitInfo, err, tail)
 	}
 
 	m.mu.Unlock()
@@ -300,47 +370,81 @@ func (m *Manager) Shutdown() {
 func (m *Manager) stopLocked() {
 	if m.activeCmd != nil && m.activeCmd.Process != nil {
 		_ = m.activeCmd.Process.Kill()
-		_, _ = m.activeCmd.Process.Wait()
+		if m.activeDone != nil {
+			select {
+			case <-m.activeDone:
+			case <-time.After(3 * time.Second):
+			}
+		}
 	}
 	m.activeCmd = nil
+	m.activeDone = nil
 	m.activeMode = WorkspaceNone
 	m.activeModel = ""
 	m.activePort = 0
 }
 
-func (m *Manager) attachLogPipes(proc string, cmd *exec.Cmd) {
-	if out, err := cmd.StdoutPipe(); err == nil {
-		go m.consumeStream(proc, out)
-	}
-	if errPipe, err := cmd.StderrPipe(); err == nil {
-		go m.consumeStream(proc, errPipe)
-	}
-}
-
-func (m *Manager) consumeStream(proc string, r io.Reader) {
-	sc := bufio.NewScanner(r)
-	for sc.Scan() {
-		m.logs.Append(proc, sc.Text())
-	}
-}
-
-func waitHealthy(ctx context.Context, url string, timeout time.Duration) error {
+func waitHealthy(ctx context.Context, url string, timeout time.Duration, exited <-chan struct{}) error {
 	deadline := time.Now().Add(timeout)
-	client := &http.Client{Timeout: 1 * time.Second}
+	client := &http.Client{Timeout: 2 * time.Second}
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-exited:
+			return fmt.Errorf("o processo terminou antes de ficar pronto")
 		default:
 		}
 		resp, err := client.Get(url)
 		if err == nil {
 			_ = resp.Body.Close()
+			// 200 = pronto; 503 = ainda carregando o modelo.
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	return fmt.Errorf("timeout aguardando %s", url)
+	return fmt.Errorf("timeout de %s aguardando %s", timeout, url)
+}
+
+// lineWriter converte a saída do processo em linhas de log.
+type lineWriter struct {
+	mu   sync.Mutex
+	proc string
+	logs *LogBuffer
+	buf  []byte
+}
+
+func (w *lineWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	for {
+		i := -1
+		for j, c := range w.buf {
+			if c == '\n' || c == '\r' {
+				i = j
+				break
+			}
+		}
+		if i < 0 {
+			break
+		}
+		line := strings.TrimSpace(string(w.buf[:i]))
+		w.buf = w.buf[i+1:]
+		if line != "" {
+			w.logs.Append(w.proc, line)
+		}
+	}
+	return len(p), nil
+}
+
+func (w *lineWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if line := strings.TrimSpace(string(w.buf)); line != "" {
+		w.logs.Append(w.proc, line)
+	}
+	w.buf = nil
 }
