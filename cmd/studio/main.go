@@ -138,4 +138,4 @@ func printCheckReport(dataDir string, hw hardware.Info, caps render.Capabilities
 	}
 	fmt.Printf("  Terminal:      %dx%d | Cor: %s | Imagem: %s (detectado: %s)\n",
 		caps.Cols, caps.Rows, caps.ColorDepth, caps.EffectiveImageMode, caps.DetectedImageMode)
-
+}
