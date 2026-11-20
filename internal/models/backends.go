@@ -416,6 +416,8 @@ func openTarGzEntries(path string) ([]archiveEntry, func(), error) {
 	cleanup := func() { _ = os.RemoveAll(tmpDir) }
 
 	var out []archiveEntry
+	type pendingLink struct{ name, target string }
+	var links []pendingLink
 	tr := tar.NewReader(gz)
 	i := 0
 	for {
@@ -426,6 +428,10 @@ func openTarGzEntries(path string) ([]archiveEntry, func(), error) {
 		if err != nil {
 			cleanup()
 			return nil, func() {}, err
+		}
+		if hdr.Typeflag == tar.TypeSymlink || hdr.Typeflag == tar.TypeLink {
+			links = append(links, pendingLink{name: hdr.Name, target: filepath.Base(hdr.Linkname)})
+			continue
 		}
 		if hdr.Typeflag != tar.TypeReg {
 			continue
@@ -447,6 +453,16 @@ func openTarGzEntries(path string) ([]archiveEntry, func(), error) {
 			return writeStream(dest, in)
 		}})
 		_ = base
+	}
+	// Links simbólicos (ex.: libllama-common.so.1 -> libllama-common.so.0.0.1) viram
+	// cópias do arquivo de destino, já que o destino final pode não suportar links.
+	for _, l := range links {
+		for _, e := range out {
+			if filepath.Base(e.name) == l.target {
+				out = append(out, archiveEntry{name: l.name, write: e.write})
+				break
+			}
+		}
 	}
 	return out, cleanup, nil
 }

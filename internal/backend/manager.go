@@ -188,7 +188,7 @@ func (m *Manager) StartLlamaServer(ctx context.Context, modelPath, mmprojPath st
 	bin := m.BinaryPath("llama-server")
 	if _, err := os.Stat(bin); err != nil {
 		m.mu.Unlock()
-		return "", fmt.Errorf("binário llama-server não encontrado em %s. Reabra o aplicativo para baixar os binários ou copie o executável para essa pasta", bin)
+		return "", fmt.Errorf("binário llama-server não encontrado em %s. Execute o Scorch-Setup para instalar o motor de IA (llama-server) ou copie o executável para essa pasta", bin)
 	}
 	if st, err := os.Stat(modelPath); err != nil || st.IsDir() {
 		m.mu.Unlock()
@@ -302,7 +302,7 @@ func (m *Manager) RunStableDiffusion(ctx context.Context, args []string, onLine 
 	bin := m.BinaryPath("sd")
 	if _, err := os.Stat(bin); err != nil {
 		m.mu.Unlock()
-		return fmt.Errorf("binário stable-diffusion (sd) não encontrado em %s", bin)
+		return fmt.Errorf("binário stable-diffusion (sd) não encontrado em %s. Execute o Scorch-Setup para instalá-lo", bin)
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)

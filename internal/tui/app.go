@@ -60,22 +60,12 @@ type sdProgressMsg struct {
 	path string
 	err  error
 }
-type downloadProgressMsg models.DownloadProgress
-type downloadStartedMsg struct {
-	id     string
-	ch     chan models.DownloadProgress
-	cancel context.CancelFunc
+type titleMsg struct {
+	convID      string
+	provisional string
+	title       string
+	err         error
 }
-type wizardEvent struct {
-	status string
-	done   bool
-	err    error
-}
-type wizardStartedMsg struct {
-	ch     chan wizardEvent
-	cancel context.CancelFunc
-}
-type wizardEventMsg wizardEvent
 
 type AppModel struct {
 	deps        AppDeps
@@ -83,11 +73,6 @@ type AppModel struct {
 	height      int
 	activeTab   TabID
 	showSplash  bool
-	showWizard  bool
-	wizardBusy  bool
-	wizardNote  string
-	wizardCh    chan wizardEvent
-	wizardStop  context.CancelFunc
 	showHelp    bool
 	confirmQuit bool
 
@@ -101,6 +86,9 @@ type AppModel struct {
 	chatInput     textarea.Model
 	chatFocused   bool
 	chatSidebar   bool
+	showShortcuts bool
+	titleConvID   string
+	titleDraft    string
 	chatParams    bool
 	paramFocusIdx int
 	systemPrompt  textinput.Model
@@ -136,19 +124,15 @@ type AppModel struct {
 	gallery       []imagegen.GalleryEntry
 	galleryIdx    int
 
-	// Models state
-	catalog        []models.CatalogItem
-	installed      []models.InstalledModel
-	catalogIdx     int
-	installedIdx   int
-	focusInstalled bool
-	selectedLLM    string
-	selectedSD     string
-	importInput    textinput.Model
-	importingMode  bool
-	downloads      map[string]models.DownloadProgress
-	downloadChans  map[string]chan models.DownloadProgress
-	downloadCancel map[string]context.CancelFunc
+	// Models state (apenas listagem/ativação/importação: baixar modelos é manual)
+	installed     []models.InstalledModel
+	llmIdx        int
+	sdIdx         int
+	focusSD       bool
+	selectedLLM   string
+	selectedSD    string
+	importInput   textinput.Model
+	importingMode bool
 
 	// Monitor & Logs
 	metrics     sysmon.Metrics
@@ -204,13 +188,11 @@ func NewAppModel(deps AppDeps) AppModel {
 	impIn := textinput.New()
 	impIn.Placeholder = "Cole o caminho local (.gguf ou .safetensors) e pressione Enter..."
 
-	var cat []models.CatalogItem
 	var inst []models.InstalledModel
 	var convs []store.Conversation
 	var gal []imagegen.GalleryEntry
 
 	if deps.ModelMgr != nil {
-		cat, _ = deps.ModelMgr.LoadOrCreateCatalog()
 		inst, _ = deps.ModelMgr.ListInstalled()
 	}
 	if deps.ConvStore != nil {
@@ -230,7 +212,6 @@ func NewAppModel(deps AppDeps) AppModel {
 		activeConv = convs[0]
 	}
 
-	hasBins := deps.BackendMgr != nil && deps.BackendMgr.HasBinaries()
 	cols := deps.TermCaps.Cols
 	rows := deps.TermCaps.Rows
 	if cols <= 0 {
@@ -240,44 +221,36 @@ func NewAppModel(deps AppDeps) AppModel {
 		rows = 24
 	}
 
-	hwSummary := fmt.Sprintf("CPU: %s | GPU: %s (%s)", deps.Hardware.CPUName, deps.Hardware.GPUName, deps.Hardware.SelectedBackend)
-
 	m := AppModel{
-		deps:           deps,
-		width:          cols,
-		height:         rows,
-		activeTab:      TabChat,
-		showSplash:     true,
-		showWizard:     !hasBins,
-		wizardNote:     fmt.Sprintf("%s. Pressione Enter para baixar os binários ou Esc para pular.", hwSummary),
-		scorchState:    theme.ScorchIdle,
-		chatViewport:   vp,
-		chatInput:      ta,
-		chatFocused:    true,
-		chatSidebar:    true,
-		systemPrompt:   sysIn,
-		tempInput:      tempIn,
-		topPInput:      topPIn,
-		maxTokInput:    maxTokIn,
-		attachInput:    attachIn,
-		renameInput:    renameIn,
-		conversations:  convs,
-		activeConv:     activeConv,
-		imgInputs:      imgFields,
-		gallery:        gal,
-		catalog:        cat,
-		installed:      inst,
-		selectedLLM:    selLLM,
-		selectedSD:     selSD,
-		importInput:    impIn,
-		streamBuf:      &strings.Builder{},
-		reasonBuf:      &strings.Builder{},
-		md:             &mdCache{},
-		downloads:      make(map[string]models.DownloadProgress),
-		downloadChans:  make(map[string]chan models.DownloadProgress),
-		downloadCancel: make(map[string]context.CancelFunc),
-		logFilter:      "all",
-		logViewport:    logVp,
+		deps:          deps,
+		width:         cols,
+		height:        rows,
+		activeTab:     TabChat,
+		showSplash:    true,
+		scorchState:   theme.ScorchIdle,
+		chatViewport:  vp,
+		chatInput:     ta,
+		chatFocused:   true,
+		chatSidebar:   true,
+		systemPrompt:  sysIn,
+		tempInput:     tempIn,
+		topPInput:     topPIn,
+		maxTokInput:   maxTokIn,
+		attachInput:   attachIn,
+		renameInput:   renameIn,
+		conversations: convs,
+		activeConv:    activeConv,
+		imgInputs:     imgFields,
+		gallery:       gal,
+		installed:     inst,
+		selectedLLM:   selLLM,
+		selectedSD:    selSD,
+		importInput:   impIn,
+		streamBuf:     &strings.Builder{},
+		reasonBuf:     &strings.Builder{},
+		md:            &mdCache{},
+		logFilter:     "all",
+		logViewport:   logVp,
 	}
 	if deps.SysMon != nil {
 		deps.SysMon.SetFallbackVRAMTotal(deps.Hardware.VRAMMB)
@@ -378,7 +351,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.refreshChatViewport(true)
-			return m, nil
+			return m, m.titleCmd()
 		}
 		return m, waitNextStreamChunk(m.streamCh)
 
@@ -405,62 +378,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case downloadStartedMsg:
-		m.downloadChans[msg.id] = msg.ch
-		m.downloadCancel[msg.id] = msg.cancel
-		return m, waitNextDownloadProgress(msg.id, msg.ch)
-
-	case downloadProgressMsg:
-		m.downloads[msg.ID] = models.DownloadProgress(msg)
-		if msg.Done {
-			delete(m.downloadCancel, msg.ID)
-			delete(m.downloadChans, msg.ID)
-			if msg.Err != nil {
-				m.errMsg = "Erro no download: " + msg.Err.Error()
-				m.statusMsg = ""
-			} else if m.deps.ModelMgr != nil {
-				m.installed, _ = m.deps.ModelMgr.ListInstalled()
-				for _, im := range m.installed {
-					if im.Kind == models.KindLLM && m.selectedLLM == "" {
-						m.selectedLLM = im.Path
-					}
-					if im.Kind == models.KindCheckpoint && m.selectedSD == "" {
-						m.selectedSD = im.Path
-					}
-				}
-				m.persistSelection()
-				m.statusMsg = "Download concluído: " + msg.Name
-			}
-			return m, nil
-		}
-		if ch, ok := m.downloadChans[msg.ID]; ok {
-			return m, waitNextDownloadProgress(msg.ID, ch)
-		}
-		return m, nil
-
-	case wizardStartedMsg:
-		m.wizardCh = msg.ch
-		m.wizardStop = msg.cancel
-		return m, waitWizardEvent(msg.ch)
-
-	case wizardEventMsg:
-		if msg.status != "" {
-			m.wizardNote = msg.status
-		}
-		if !msg.done {
-			return m, waitWizardEvent(m.wizardCh)
-		}
-		m.wizardBusy = false
-		m.wizardCh = nil
-		m.wizardStop = nil
-		if msg.err != nil {
-			m.wizardNote = "Falha ao baixar binários: " + msg.err.Error() + "  —  Enter tenta de novo, Esc pula."
-		} else {
-			m.showWizard = false
-			m.errMsg = ""
-			m.statusMsg = "Binários instalados com sucesso."
-		}
-		return m, nil
+	case titleMsg:
+		return m.applyGeneratedTitle(msg), nil
 
 	case tea.KeyMsg:
 		mm, cmd := m.handleKey(msg)
@@ -471,7 +390,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
-	if m.activeTab == TabChat && !m.showSplash && !m.showWizard && !m.showHelp && !m.chatParams && m.chatFocused {
+	if m.activeTab == TabChat && !m.showSplash && !m.showHelp && !m.chatParams && m.chatFocused {
 		m.chatInput, cmd = m.chatInput.Update(msg)
 	}
 	return m, cmd
@@ -492,6 +411,11 @@ func (m *AppModel) switchTab(tab TabID) {
 	m.activeTab = tab
 	// Sai do modo de edição dos formulários ao trocar de aba.
 	m.stopImageEditing()
+	if tab == TabModels && m.deps.ModelMgr != nil {
+		// Reescaneia as pastas: o usuário pode ter copiado arquivos manualmente.
+		m.installed, _ = m.deps.ModelMgr.ListInstalled()
+		m.clampModelIdx()
+	}
 	if tab == TabMonitor && m.deps.SysMon != nil {
 		m.metrics = m.deps.SysMon.Sample()
 	} else if tab == TabLogs {
@@ -513,41 +437,6 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.showSplash {
 		if key == "enter" || key == " " || key == "esc" {
 			m.showSplash = false
-		}
-		return m, nil
-	}
-
-	if m.showWizard {
-		switch key {
-		case "esc":
-			if m.wizardStop != nil {
-				m.wizardStop()
-			}
-			m.showWizard = false
-			m.wizardBusy = false
-			m.statusMsg = "Download de binários cancelado. Pressione Ctrl+B para baixar depois."
-		case "enter":
-			if !m.wizardBusy && m.deps.ModelMgr != nil {
-				m.wizardBusy = true
-				m.wizardNote = "Preparando download dos binários do backend (llama-server e sd)..."
-				backendName := string(m.deps.Hardware.SelectedBackend)
-				mgr := m.deps.ModelMgr
-				return m, func() tea.Msg {
-					ctx, cancel := context.WithCancel(context.Background())
-					ch := make(chan wizardEvent, 64)
-					go func() {
-						err := mgr.InstallBackendBinaries(ctx, backendName, func(s string) {
-							select {
-							case ch <- wizardEvent{status: s}:
-							default: // descarta atualizações antigas se a interface estiver atrasada
-							}
-						})
-						ch <- wizardEvent{done: true, err: err}
-						close(ch)
-					}()
-					return wizardStartedMsg{ch: ch, cancel: cancel}
-				}
-			}
 		}
 		return m, nil
 	}
@@ -577,6 +466,13 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// F2 mostra/oculta a lista de atalhos do chat.
+	if key == "f2" && m.activeTab == TabChat {
+		m.showShortcuts = !m.showShortcuts
+		m.resizeViewports()
+		return m, nil
+	}
+
 	// Alt+1..5 sempre troca de aba, mesmo com um campo de texto em edição.
 	switch key {
 	case "alt+1":
@@ -593,11 +489,6 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "alt+5":
 		m.switchTab(TabLogs)
-		return m, nil
-	case "ctrl+b":
-		m.showWizard = true
-		m.wizardNote = fmt.Sprintf("CPU: %s | GPU: %s (%s). Pressione Enter para baixar os binários ou Esc para pular.",
-			m.deps.Hardware.CPUName, m.deps.Hardware.GPUName, m.deps.Hardware.SelectedBackend)
 		return m, nil
 	}
 
@@ -849,6 +740,9 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				title = title[:28] + "..."
 			}
 			m.activeConv.Title = title
+			// O próprio modelo substituirá este título provisório após a 1ª resposta.
+			m.titleConvID = m.activeConv.ID
+			m.titleDraft = title
 		}
 
 		userMsg := llm.Message{
@@ -959,16 +853,6 @@ func waitNextStreamChunk(ch <-chan llm.StreamChunk) tea.Cmd {
 			return streamChunkMsg{Done: true}
 		}
 		return streamChunkMsg(chunk)
-	}
-}
-
-func waitNextDownloadProgress(id string, ch <-chan models.DownloadProgress) tea.Cmd {
-	return func() tea.Msg {
-		prog, ok := <-ch
-		if !ok {
-			return downloadProgressMsg{ID: id, Done: true}
-		}
-		return downloadProgressMsg(prog)
 	}
 }
 
@@ -1167,27 +1051,35 @@ func (m *AppModel) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	list := m.modelsOfKind(m.focusSD)
+	idx := &m.llmIdx
+	if m.focusSD {
+		idx = &m.sdIdx
+	}
+
 	switch key {
 	case "tab":
-		m.focusInstalled = !m.focusInstalled
+		m.focusSD = !m.focusSD
 	case "up", "k":
-		if !m.focusInstalled && m.catalogIdx > 0 {
-			m.catalogIdx--
-		} else if m.focusInstalled && m.installedIdx > 0 {
-			m.installedIdx--
+		if *idx > 0 {
+			*idx--
 		}
 	case "down", "j":
-		if !m.focusInstalled && m.catalogIdx < len(m.catalog)-1 {
-			m.catalogIdx++
-		} else if m.focusInstalled && m.installedIdx < len(m.installed)-1 {
-			m.installedIdx++
+		if *idx < len(list)-1 {
+			*idx++
 		}
 	case "i":
 		m.importingMode = true
 		m.importInput.Focus()
+	case "r":
+		if m.deps.ModelMgr != nil {
+			m.installed, _ = m.deps.ModelMgr.ListInstalled()
+			m.clampModelIdx()
+			m.statusMsg = "Lista de modelos atualizada."
+		}
 	case "d", "delete":
-		if m.focusInstalled && len(m.installed) > 0 && m.installedIdx < len(m.installed) && m.deps.ModelMgr != nil {
-			target := m.installed[m.installedIdx]
+		if len(list) > 0 && *idx < len(list) && m.deps.ModelMgr != nil {
+			target := list[*idx]
 			if freed, err := m.deps.ModelMgr.DeleteModel(target.Path); err == nil {
 				m.statusMsg = fmt.Sprintf("Modelo removido (%d MB liberados).", freed/(1024*1024))
 				m.installed, _ = m.deps.ModelMgr.ListInstalled()
@@ -1199,79 +1091,104 @@ func (m *AppModel) handleModelsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				m.selectedLLM, m.selectedSD = fillSelection(m.selectedLLM, m.selectedSD, m.installed)
 				m.persistSelection()
-				if m.installedIdx >= len(m.installed) && m.installedIdx > 0 {
-					m.installedIdx--
-				}
+				m.clampModelIdx()
 			} else {
 				m.errMsg = err.Error()
 			}
 		}
 	case "enter":
-		if m.focusInstalled {
-			if len(m.installed) > 0 && m.installedIdx < len(m.installed) {
-				sel := m.installed[m.installedIdx]
-				if sel.Kind == models.KindLLM {
-					m.selectedLLM = sel.Path
-					m.statusMsg = "LLM ativo: " + sel.Name
-				} else {
-					m.selectedSD = sel.Path
-					m.statusMsg = "Checkpoint SD ativo: " + sel.Name
-				}
-				m.persistSelection()
-			}
-			return m, nil
-		}
-		if len(m.catalog) > 0 && m.catalogIdx < len(m.catalog) && m.deps.ModelMgr != nil {
-			item := m.catalog[m.catalogIdx]
-
-			// Já baixado em uma sessão anterior: apenas ativa, sem baixar de novo.
-			m.installed, _ = m.deps.ModelMgr.ListInstalled()
-			if im, ok := m.findInstalled(item); ok {
-				if im.Kind == models.KindLLM {
-					m.selectedLLM = im.Path
-				} else {
-					m.selectedSD = im.Path
-				}
-				m.persistSelection()
-				m.errMsg = ""
-				m.statusMsg = "Modelo já instalado, ativado: " + item.Name
-				return m, nil
-			}
-
-			if _, exists := m.downloadCancel[item.ID]; exists {
-				m.statusMsg = "Download já em andamento: " + item.Name
-				return m, nil
+		if len(list) > 0 && *idx < len(list) {
+			sel := list[*idx]
+			if sel.Kind == models.KindLLM {
+				m.selectedLLM = sel.Path
+				m.statusMsg = "LLM ativo: " + sel.Name
+			} else {
+				m.selectedSD = sel.Path
+				m.statusMsg = "Checkpoint de imagem ativo: " + sel.Name
 			}
 			m.errMsg = ""
-			m.statusMsg = "Iniciando download: " + item.Name
-			m.downloads[item.ID] = models.DownloadProgress{
-				ID:   item.ID,
-				Name: item.Name,
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			ch := make(chan models.DownloadProgress, 16)
-			mgr := m.deps.ModelMgr
-			go func() {
-				err := mgr.DownloadWithResume(ctx, item, func(p models.DownloadProgress) {
-					select {
-					case ch <- p:
-					default:
-					}
-				})
-				ch <- models.DownloadProgress{
-					ID:   item.ID,
-					Name: item.Name,
-					Done: true,
-					Err:  err,
-				}
-				close(ch)
-			}()
-			return m, func() tea.Msg {
-				return downloadStartedMsg{id: item.ID, ch: ch, cancel: cancel}
-			}
+			m.persistSelection()
 		}
 	}
 	return m, nil
+}
+
+// modelsOfKind devolve os modelos instalados de um tipo (LLM ou checkpoint de imagem).
+func (m AppModel) modelsOfKind(checkpoints bool) []models.InstalledModel {
+	var out []models.InstalledModel
+	for _, im := range m.installed {
+		if (im.Kind == models.KindCheckpoint) == checkpoints {
+			out = append(out, im)
+		}
+	}
+	return out
+}
+
+func (m *AppModel) clampModelIdx() {
+	if n := len(m.modelsOfKind(false)); m.llmIdx >= n {
+		m.llmIdx = maxInt(0, n-1)
+	}
+	if n := len(m.modelsOfKind(true)); m.sdIdx >= n {
+		m.sdIdx = maxInt(0, n-1)
+	}
+}
+
+// titleCmd pede ao modelo um título para a conversa, apenas uma vez, após a
+// primeira resposta. Roda em segundo plano e reaproveita o servidor já iniciado.
+func (m *AppModel) titleCmd() tea.Cmd {
+	if m.titleConvID == "" || m.titleConvID != m.activeConv.ID || m.deps.BackendMgr == nil || m.selectedLLM == "" {
+		return nil
+	}
+	msgs := m.activeConv.Messages
+	var userText, answer string
+	for _, mm := range msgs {
+		if mm.Role == "user" && userText == "" {
+			userText = mm.Content
+		}
+		if mm.Role == "assistant" && answer == "" {
+			answer = mm.Content
+		}
+	}
+	if userText == "" || answer == "" {
+		return nil
+	}
+	convID, draft, modelPath := m.titleConvID, m.titleDraft, m.selectedLLM
+	m.titleConvID, m.titleDraft = "", ""
+	bm := m.deps.BackendMgr
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		endpoint, err := bm.StartLlamaServer(ctx, modelPath, "", nil)
+		if err != nil {
+			return titleMsg{convID: convID, provisional: draft, err: err}
+		}
+		title, err := llm.GenerateTitle(ctx, endpoint, userText, answer)
+		return titleMsg{convID: convID, provisional: draft, title: title, err: err}
+	}
+}
+
+// applyGeneratedTitle grava o título gerado, sem sobrescrever um título que o
+// usuário tenha renomeado manualmente enquanto o modelo trabalhava.
+func (m AppModel) applyGeneratedTitle(msg titleMsg) AppModel {
+	if msg.err != nil || msg.title == "" || m.deps.ConvStore == nil {
+		return m
+	}
+	convs, _ := m.deps.ConvStore.List()
+	for _, c := range convs {
+		if c.ID == msg.convID {
+			if c.Title != msg.provisional {
+				return m
+			}
+			if err := m.deps.ConvStore.Rename(msg.convID, msg.title); err != nil {
+				return m
+			}
+		}
+	}
+	if m.activeConv.ID == msg.convID && m.activeConv.Title == msg.provisional {
+		m.activeConv.Title = msg.title
+	}
+	m.conversations, _ = m.deps.ConvStore.List()
+	return m
 }
 
 func (m *AppModel) refreshChatViewport(scrollBottom bool) {
@@ -1328,16 +1245,6 @@ func (m *AppModel) refreshLogViewport() {
 	}
 	m.logViewport.SetContent(sb.String())
 	m.logViewport.GotoBottom()
-}
-
-func waitWizardEvent(ch <-chan wizardEvent) tea.Cmd {
-	return func() tea.Msg {
-		ev, ok := <-ch
-		if !ok {
-			return wizardEventMsg{done: true}
-		}
-		return wizardEventMsg(ev)
-	}
 }
 
 // ---- seleção de modelos persistida entre sessões
@@ -1421,15 +1328,6 @@ func (c *mdCache) render(text, style string, width int) string {
 }
 
 // findInstalled procura o item do catálogo entre os modelos já instalados (pelo nome do arquivo).
-func (m *AppModel) findInstalled(item models.CatalogItem) (models.InstalledModel, bool) {
-	for _, im := range m.installed {
-		if strings.EqualFold(im.Name, item.Filename) {
-			return im, true
-		}
-	}
-	return models.InstalledModel{}, false
-}
-
 // fillSelection completa seleções vazias com o primeiro modelo instalado de cada tipo.
 func fillSelection(llmPath, sdPath string, installed []models.InstalledModel) (string, string) {
 	for _, im := range installed {

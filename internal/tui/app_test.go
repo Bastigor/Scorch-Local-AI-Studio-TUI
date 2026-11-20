@@ -35,7 +35,6 @@ func newTestAppModel(cols, rows int) AppModel {
 		TermCaps: caps,
 	})
 	m.showSplash = false
-	m.showWizard = false
 	return m
 }
 

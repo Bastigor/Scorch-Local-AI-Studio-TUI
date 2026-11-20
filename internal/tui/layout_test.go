@@ -87,3 +87,38 @@ func TestImagesTabNumbersWorkWithoutEditing(t *testing.T) {
 		t.Fatal("Alt+4 deveria trocar de aba e encerrar a edição")
 	}
 }
+
+func TestChatShortcutsToggleWithF2AndStatusHint(t *testing.T) {
+	m := newTestAppModel(100, 30)
+	if strings.Contains(m.View(), "Atalhos do chat (F2 oculta)") {
+		t.Fatal("a lista de atalhos deve começar oculta")
+	}
+	if !strings.Contains(m.View(), "[F2] Atalhos do chat") {
+		t.Fatal("a barra de status do chat deve mostrar o atalho F2")
+	}
+	m = sendKey(m, tea.KeyMsg{Type: tea.KeyF2})
+	if !strings.Contains(m.View(), "Atalhos do chat (F2 oculta)") || !strings.Contains(m.View(), "[Ctrl+N] Novo Chat") {
+		t.Fatal("F2 deveria exibir a lista de atalhos")
+	}
+	m = sendKey(m, tea.KeyMsg{Type: tea.KeyF2})
+	if strings.Contains(m.View(), "Atalhos do chat (F2 oculta)") {
+		t.Fatal("F2 deveria ocultar a lista novamente")
+	}
+	// O atalho só é anunciado no menu de chat.
+	m = sendKey(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2"), Alt: true})
+	if strings.Contains(m.View(), "[F2] Atalhos do chat") {
+		t.Fatal("F2 não deve aparecer na barra de status fora do chat")
+	}
+}
+
+func TestSplashShowsNameOnce(t *testing.T) {
+	m := newTestAppModel(100, 30)
+	m.showSplash = true
+	out := m.View()
+	if n := strings.Count(out, "Scorch Local AI Studio"); n != 1 {
+		t.Fatalf("o nome deveria aparecer uma única vez na tela inicial, apareceu %d", n)
+	}
+	if strings.Contains(out, "Local AI Studio TUI") {
+		t.Fatal("nome antigo ainda presente")
+	}
+}

@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/lipgloss"
+	"local-ai-studio-tui/internal/models"
 	"local-ai-studio-tui/internal/tui/theme"
 )
 
@@ -189,6 +190,7 @@ func chatShortcutItems() []string {
 		"[Ctrl+A] Anexar",
 		"[Ctrl+Y] Copiar",
 		"[Ctrl+S] Parar",
+		"[F2] Ocultar atalhos",
 	}
 }
 
@@ -216,8 +218,10 @@ func (m AppModel) chatLayout() chatDims {
 		d.sidebarW = sideW
 	}
 	d.mainW = w - d.sidebarW
-	d.lines = wrapItems(chatShortcutItems(), maxInt(10, w-4), "  ")
-	d.toolbarH = len(d.lines) + 2
+	if m.showShortcuts {
+		d.lines = wrapItems(chatShortcutItems(), maxInt(10, w-4), "  ")
+		d.toolbarH = len(d.lines) + 2
+	}
 	d.inputH = 5
 	if m.chatParams {
 		d.extraH += 6
@@ -261,20 +265,19 @@ func (m AppModel) View() string {
 	}
 
 	if m.showSplash {
-		return center("Local AI Studio TUI", pal.Accent.Render("Local AI Studio TUI")+"\n\nAperte Enter para continuar", 50, true)
-	}
-
-	if m.showWizard {
-		return center("Configuração Inicial de Binários",
-			m.wizardNote+"\n\n"+pal.Selected.Render("[Enter] Baixar binários")+"   [Esc] Pular", 90, true)
+		notice := ""
+		if m.deps.BackendMgr != nil && !m.deps.BackendMgr.HasBinaries() {
+			notice = "\n\n" + pal.Error.Render("Motor de IA não encontrado. Execute o Scorch-Setup antes de usar.")
+		}
+		return center("", pal.Accent.Render("Scorch Local AI Studio")+"\n\nAperte Enter para continuar"+notice, 60, true)
 	}
 
 	if m.showHelp {
 		help := "1..5: Alternar abas (Chat, Imagens, Modelos, Monitor, Logs). Alt+1..5 funciona mesmo durante a digitação.\n\n" +
-			"Chat: Esc Alterna foco prompt/menus | Ctrl+N Novo chat | Ctrl+H Histórico | Ctrl+↑/↓ Trocar chat | Ctrl+P Parâmetros | Ctrl+R Renomear | Ctrl+A Anexar | Ctrl+Y Copiar | Ctrl+S Parar\n\n" +
+			"Chat: F2 Mostra/oculta atalhos | Esc Alterna foco prompt/menus | Ctrl+N Novo chat | Ctrl+H Histórico | Ctrl+↑/↓ Trocar chat | Ctrl+P Parâmetros | Ctrl+R Renomear | Ctrl+A Anexar | Ctrl+Y Copiar | Ctrl+S Parar\n\n" +
 			"Imagens: ↑/↓/Tab Navegar | Enter ou i Editar campo | Enter/Esc Terminar edição | Ctrl+G Gerar | Ctrl+X Cancelar | Ctrl+O Abrir\n\n" +
-			"Modelos: ↑/↓ Navegar | Enter Baixar/Ativar | Tab Alternar lista | i Importar local | d Excluir\n\n" +
-			"Geral: ? ou F1 Ajuda | Ctrl+B Baixar binários do backend | Ctrl+C Sair"
+			"Modelos: ↑/↓ Navegar | Enter Ativar | Tab Alternar LLM/Imagem | i Importar arquivo | r Atualizar lista | d Excluir\n\n" +
+			"Geral: ? ou F1 Ajuda | Ctrl+C Sair"
 		return center("Atalhos Principais", help, 100, true)
 	}
 
@@ -292,7 +295,7 @@ func (m AppModel) View() string {
 			renderedTabs = append(renderedTabs, pal.InactiveTab.Render(t))
 		}
 	}
-	header := renderBox(pal, "Local AI Studio", lipgloss.JoinHorizontal(lipgloss.Left, renderedTabs...), m.width, headerH, false)
+	header := renderBox(pal, "Scorch Local AI Studio", lipgloss.JoinHorizontal(lipgloss.Left, renderedTabs...), m.width, headerH, false)
 
 	// ----- corpo -----
 	var body string
@@ -312,7 +315,11 @@ func (m AppModel) View() string {
 	// ----- barra de status (2 linhas de texto) -----
 	statusInner := m.width - 4
 	statusBody := lipgloss.NewStyle().Width(statusInner).MaxWidth(statusInner).Render(m.statusText(pal))
-	hint := pal.Muted.Render("[?] Ajuda  [Alt+1..5] Abas  [Ctrl+B] Baixar binários  [Ctrl+C] Sair")
+	hintText := "[?] Ajuda  [Alt+1..5] Abas  [Ctrl+C] Sair"
+	if m.activeTab == TabChat {
+		hintText = "[F2] Atalhos do chat  " + hintText
+	}
+	hint := pal.Muted.Render(hintText)
 	statusLines := strings.Split(statusBody, "\n")
 	if len(statusLines) > 1 {
 		statusLines = statusLines[:1]
@@ -333,7 +340,10 @@ func (m AppModel) viewChat(pal theme.Palette) string {
 	for i, l := range d.lines {
 		toolbarText[i] = pal.Muted.Render(l)
 	}
-	toolbar := renderBox(pal, "Atalhos", strings.Join(toolbarText, "\n"), m.width, d.toolbarH, false)
+	toolbar := ""
+	if d.toolbarH > 0 {
+		toolbar = renderBox(pal, "Atalhos do chat (F2 oculta)", strings.Join(toolbarText, "\n"), m.width, d.toolbarH, false)
+	}
 
 	var parts []string
 
@@ -401,6 +411,9 @@ func (m AppModel) viewChat(pal theme.Palette) string {
 		}
 		sidebar := renderBox(pal, "Conversas", strings.Join(sideLines, "\n"), d.sidebarW, bh-d.toolbarH, false)
 		row = lipgloss.JoinHorizontal(lipgloss.Top, sidebar, mainCol)
+	}
+	if toolbar == "" {
+		return row
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, toolbar, row)
 }
@@ -489,65 +502,54 @@ func baseOrNone(p string) string {
 
 func (m AppModel) viewModels(pal theme.Palette) string {
 	bh := m.bodyHeight()
+	infoH := 6
 	importH := 0
 	if m.importingMode {
 		importH = 3
 	}
-	avail := bh - importH
-	catH := avail / 2
-	instH := avail - catH
+	avail := bh - infoH - importH
+	llmH := avail / 2
+	sdH := avail - llmH
 
-	var catLines []string
-	for _, item := range m.catalog {
-		line := fmt.Sprintf("%s (%s)", item.Name, item.SizeHuman)
-		if im, ok := m.findInstalled(item); ok {
-			line += "  [INSTALADO]"
+	list := func(items []models.InstalledModel, sel int, focused bool, h int, empty string) string {
+		var lines []string
+		if len(items) == 0 {
+			lines = append(lines, pal.Muted.Render("  "+empty))
+		}
+		for i, im := range items {
+			line := im.Name
 			if im.Path == m.selectedLLM || im.Path == m.selectedSD {
-				line += " [ATIVO]"
+				line += "  [ATIVO]"
 			}
-		} else if m.deps.ModelMgr != nil && m.deps.ModelMgr.HasPartial(item) {
-			line += "  [parcial — Enter retoma]"
-		}
-		if prog, ok := m.downloads[item.ID]; ok && !prog.Done {
-			pct := 0.0
-			if prog.Total > 0 {
-				pct = float64(prog.Downloaded) * 100 / float64(prog.Total)
+			if focused && i == sel {
+				lines = append(lines, pal.Selected.Render("> "+line))
+			} else {
+				lines = append(lines, "  "+line)
 			}
-			line += fmt.Sprintf("  [Baixando: %.1f%% | %.1f MB/s]", pct, prog.SpeedBPS/(1024*1024))
 		}
-		catLines = append(catLines, line)
+		return strings.Join(windowLines(lines, sel, h-2), "\n")
 	}
-	for i := range catLines {
-		if !m.focusInstalled && i == m.catalogIdx {
-			catLines[i] = pal.Selected.Render("> " + catLines[i])
-		} else {
-			catLines[i] = "  " + catLines[i]
-		}
-	}
-	catLines = windowLines(catLines, m.catalogIdx, catH-2)
 
-	var instLines []string
-	if len(m.installed) == 0 {
-		instLines = append(instLines, pal.Muted.Render("  Nenhum modelo instalado ainda."))
-	}
-	for idx, im := range m.installed {
-		activeTag := ""
-		if im.Path == m.selectedLLM || im.Path == m.selectedSD {
-			activeTag = " [ATIVO]"
-		}
-		line := fmt.Sprintf("%s [%s]%s", im.Name, im.Kind, activeTag)
-		if m.focusInstalled && idx == m.installedIdx {
-			instLines = append(instLines, pal.Selected.Render("> "+line))
-		} else {
-			instLines = append(instLines, "  "+line)
-		}
-	}
-	instLines = windowLines(instLines, m.installedIdx, instH-2)
+	llms := m.modelsOfKind(false)
+	sds := m.modelsOfKind(true)
+	editing := m.importingMode
 
-	catBox := renderBox(pal, "Catálogo — [Enter] baixar/ativar  [i] importar local  [Tab] alternar lista", strings.Join(catLines, "\n"), m.width, catH, !m.focusInstalled && !m.importingMode)
-	instBox := renderBox(pal, fmt.Sprintf("Modelos Instalados (%d) — [Enter] ativar  [d] remover", len(m.installed)), strings.Join(instLines, "\n"), m.width, instH, m.focusInstalled && !m.importingMode)
+	llmBox := renderBox(pal, fmt.Sprintf("Modelos de Linguagem (%d) — [Enter] ativar  [d] remover", len(llms)),
+		list(llms, m.llmIdx, !m.focusSD, llmH, "Nenhum modelo .gguf encontrado."), m.width, llmH, !m.focusSD && !editing)
+	sdBox := renderBox(pal, fmt.Sprintf("Checkpoints de Imagem (%d) — [Enter] ativar  [d] remover", len(sds)),
+		list(sds, m.sdIdx, m.focusSD, sdH, "Nenhum checkpoint .safetensors/.ckpt encontrado."), m.width, sdH, m.focusSD && !editing)
 
-	parts := []string{catBox, instBox}
+	dir := "studio-data"
+	if m.deps.DataDir != "" {
+		dir = m.deps.DataDir
+	}
+	info := pal.Muted.Render("Adicione modelos copiando os arquivos para:") + "\n" +
+		filepath.Join(dir, "models", "llm") + "  (LLM .gguf)\n" +
+		filepath.Join(dir, "models", "checkpoints") + "  (imagem)\n" +
+		pal.Muted.Render("ou use [i] para importar um arquivo • [Tab] alterna a lista • [r] atualiza")
+	infoBox := renderBox(pal, "Como adicionar modelos", info, m.width, infoH, false)
+
+	parts := []string{llmBox, sdBox, infoBox}
 	if m.importingMode {
 		parts = append(parts, renderBox(pal, "Importar (.gguf / .safetensors) — Enter confirma, Esc cancela", inputView(m.importInput, m.width-6), m.width, importH, true))
 	}

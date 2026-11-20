@@ -117,7 +117,7 @@ func main() {
 }
 
 func printCheckReport(dataDir string, hw hardware.Info, caps render.Capabilities) {
-	fmt.Println("Local AI Studio — Diagnóstico de Ambiente")
+	fmt.Println("Scorch Local AI Studio — Diagnóstico de Ambiente")
 	fmt.Printf("  SO / Arq:      %s/%s\n", hw.OS, hw.Arch)
 	fmt.Printf("  Data Dir:      %s\n", dataDir)
 	fmt.Printf("  CPU:           %s (%d núcleos)\n", hw.CPUName, hw.CPUCores)

@@ -68,3 +68,36 @@ func TestStreamChatCompletionReasoningAndServerError(t *testing.T) {
 		t.Fatalf("esperava erro do servidor, obteve %v", gotErr)
 	}
 }
+
+func TestCleanTitle(t *testing.T) {
+	cases := map[string]string{
+		"\"Receita de bolo de cenoura.\"":             "Receita de bolo de cenoura",
+		"Título: Dúvidas sobre Go\nOutra linha":       "Dúvidas sobre Go",
+		"<think>hmm</think>\n**Ordenação de listas**": "Ordenação de listas",
+		"   ": "",
+	}
+	for in, want := range cases {
+		if got := CleanTitle(in); got != want {
+			t.Errorf("CleanTitle(%q) = %q, queria %q", in, got, want)
+		}
+	}
+	long := CleanTitle(strings.Repeat("palavra ", 20))
+	if len([]rune(long)) > 40 {
+		t.Errorf("título deveria ter no máximo 40 caracteres: %d", len([]rune(long)))
+	}
+}
+
+func TestGenerateTitleUsesModelOutput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"\\\"Bolo de \"}}]}\n\n")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"cenoura\\\"\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	title, err := GenerateTitle(context.Background(), srv.URL, "como fazer bolo?", "Misture os ingredientes...")
+	if err != nil || title != "Bolo de cenoura" {
+		t.Fatalf("título=%q err=%v", title, err)
+	}
+}

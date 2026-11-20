@@ -126,6 +126,7 @@ func TestExtractTarGz(t *testing.T) {
 	add("llama-b1/llama-server", "SRV")
 	add("llama-b1/libggml.so", "LIB")
 	add("llama-b1/LICENSE", "lic")
+	_ = tw.WriteHeader(&tar.Header{Name: "llama-b1/libggml.so.1", Linkname: "libggml.so", Typeflag: tar.TypeSymlink})
 	_ = tw.Close()
 	_ = gz.Close()
 	_ = os.WriteFile(tgz, buf.Bytes(), 0o644)
@@ -140,6 +141,9 @@ func TestExtractTarGz(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(bin, "libggml.so")); err != nil {
 		t.Fatal("libggml.so não extraída")
+	}
+	if b, _ := os.ReadFile(filepath.Join(bin, "libggml.so.1")); string(b) != "LIB" {
+		t.Fatalf("link simbólico deveria virar cópia da biblioteca: %q", b)
 	}
 	if _, err := os.Stat(filepath.Join(bin, "LICENSE")); err == nil {
 		t.Fatal("LICENSE não deveria ser extraído")

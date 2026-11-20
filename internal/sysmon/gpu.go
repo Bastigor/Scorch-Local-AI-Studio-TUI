@@ -31,7 +31,12 @@ const windowsGPUScript = `$ErrorActionPreference='SilentlyContinue'
 $inv=[cultureinfo]::InvariantCulture
 $u=(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine | Where-Object { $_.Name -like '*engtype_3D*' -or $_.Name -like '*engtype_Compute*' } | Measure-Object UtilizationPercentage -Sum).Sum
 $m=(Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory | Measure-Object DedicatedUsage -Sum).Sum
-$t=(Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11cd-bfc1-08002be10318}\0*' -Name 'HardwareInformation.qwMemorySize' | ForEach-Object { $_.'HardwareInformation.qwMemorySize' } | Measure-Object -Maximum).Maximum
+$t=0
+Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11cd-bfc1-08002be10318}\0*' | ForEach-Object {
+  $v=$_.'HardwareInformation.qwMemorySize'
+  if ($v -is [byte[]]) { $b=New-Object byte[] 8; [Array]::Copy($v,$b,[Math]::Min(8,$v.Length)); $v=[BitConverter]::ToUInt64($b,0) }
+  if ($v -ne $null -and [double]$v -gt $t) { $t=[double]$v }
+}
 if ($u -eq $null) { $u = 0 }
 if ($m -eq $null) { $m = 0 }
 if ($t -eq $null) { $t = 0 }

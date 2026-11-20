@@ -66,7 +66,7 @@ func TestChatEndToEndWithFakeServer(t *testing.T) {
 		BackendMgr: bm,
 		ConvStore:  store.NewConversationStore(filepath.Join(dir, "conversations")),
 	})
-	m.showSplash, m.showWizard = false, false
+	m.showSplash = false
 	m.selectedLLM = modelPath
 
 	var model tea.Model = m
@@ -89,6 +89,13 @@ func TestChatEndToEndWithFakeServer(t *testing.T) {
 	msgs := am.activeConv.Messages
 	if len(msgs) != 2 || msgs[1].Role != "assistant" || msgs[1].Content != "Olá, mundo!" {
 		t.Fatalf("mensagens inesperadas: %+v", msgs)
+	}
+	// O modelo (servidor falso) devolve o texto acima também para o pedido de título.
+	if am.activeConv.Title != "Olá, mundo" {
+		t.Fatalf("título automático não aplicado: %q", am.activeConv.Title)
+	}
+	if convs, _ := am.deps.ConvStore.List(); len(convs) == 0 || convs[0].Title != "Olá, mundo" {
+		t.Fatalf("título não persistido: %+v", convs)
 	}
 	if !strings.Contains(am.View(), "Conversa") {
 		t.Fatal("view sem painel de conversa")
