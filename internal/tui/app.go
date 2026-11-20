@@ -90,6 +90,7 @@ type AppModel struct {
 	// Chat state
 	chatViewport  viewport.Model
 	chatInput     textarea.Model
+	chatFocused   bool
 	chatSidebar   bool
 	chatParams    bool
 	paramFocusIdx int
@@ -113,7 +114,7 @@ type AppModel struct {
 
 	// Images state
 	imgInputs     []textinput.Model
-	imgFocusIdx   int // 0..8 = inputs, 9 = botão Gerar
+	imgFocusIdx   int
 	imgGenerating bool
 	imgProgress   float64
 	imgCancel     context.CancelFunc
@@ -144,7 +145,7 @@ type AppModel struct {
 
 func NewAppModel(deps AppDeps) AppModel {
 	ta := textarea.New()
-	ta.Placeholder = "Digite sua mensagem... (Enter envia, Alt+Enter ou Ctrl+J quebra linha)"
+	ta.Placeholder = "Digite sua mensagem... (Enter envia, Esc alterna foco dos menus)"
 	ta.Focus()
 	ta.SetHeight(3)
 	ta.ShowLineNumbers = false
@@ -232,6 +233,8 @@ func NewAppModel(deps AppDeps) AppModel {
 		rows = 24
 	}
 
+	hwSummary := fmt.Sprintf("CPU: %s | GPU: %s (%s)", deps.Hardware.CPUName, deps.Hardware.GPUName, deps.Hardware.SelectedBackend)
+
 	m := AppModel{
 		deps:           deps,
 		width:          cols,
@@ -239,10 +242,11 @@ func NewAppModel(deps AppDeps) AppModel {
 		activeTab:      TabChat,
 		showSplash:     true,
 		showWizard:     !hasBins,
-		wizardNote:     fmt.Sprintf("Hardware detectado: %s (%s). Pressione Enter para baixar os binários ou Esc para pular.", deps.Hardware.GPUName, deps.Hardware.SelectedBackend),
+		wizardNote:     fmt.Sprintf("%s. Pressione Enter para baixar os binários ou Esc para pular.", hwSummary),
 		scorchState:    theme.ScorchIdle,
 		chatViewport:   vp,
 		chatInput:      ta,
+		chatFocused:    true,
 		chatSidebar:    true,
 		systemPrompt:   sysIn,
 		tempInput:      tempIn,
@@ -411,7 +415,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var cmd tea.Cmd
-	if m.activeTab == TabChat && !m.showSplash && !m.showWizard && !m.showHelp && !m.chatParams {
+	if m.activeTab == TabChat && !m.showSplash && !m.showWizard && !m.showHelp && !m.chatParams && m.chatFocused {
 		m.chatInput, cmd = m.chatInput.Update(msg)
 	}
 	return m, cmd
@@ -434,6 +438,15 @@ func (m *AppModel) resizeViewports() {
 	m.chatViewport.Height = h
 	m.logViewport.Width = m.width - 6
 	m.logViewport.Height = h
+}
+
+func (m *AppModel) switchTab(tab TabID) {
+	m.activeTab = tab
+	if tab == TabMonitor && m.deps.SysMon != nil {
+		m.metrics = m.deps.SysMon.Sample()
+	} else if tab == TabLogs {
+		m.refreshLogViewport()
+	}
 }
 
 func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -490,11 +503,14 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	isTypingText := (m.activeTab == TabChat && !m.chatParams) ||
-		(m.activeTab == TabImages && m.imgFocusIdx < len(m.imgInputs)) ||
-		(m.activeTab == TabModels && m.importingMode)
+	inModalInput := m.activeTab == TabChat && (m.chatParams || m.renamingConv || m.attachingImg)
+	chatInputEmpty := m.activeTab == TabChat && !inModalInput && strings.TrimSpace(m.chatInput.Value()) == ""
 
-	if !isTypingText {
+	canNavigateGlobal := !inModalInput && (m.activeTab != TabChat || !m.chatFocused || chatInputEmpty) &&
+		!(m.activeTab == TabImages && m.imgFocusIdx < len(m.imgInputs)) &&
+		!(m.activeTab == TabModels && m.importingMode)
+
+	if canNavigateGlobal {
 		switch key {
 		case "q":
 			m.confirmQuit = true
@@ -503,23 +519,19 @@ func (m *AppModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.showHelp = !m.showHelp
 			return m, nil
 		case "1":
-			m.activeTab = TabChat
+			m.switchTab(TabChat)
 			return m, nil
 		case "2":
-			m.activeTab = TabImages
+			m.switchTab(TabImages)
 			return m, nil
 		case "3":
-			m.activeTab = TabModels
+			m.switchTab(TabModels)
 			return m, nil
 		case "4":
-			m.activeTab = TabMonitor
-			if m.deps.SysMon != nil {
-				m.metrics = m.deps.SysMon.Sample()
-			}
+			m.switchTab(TabMonitor)
 			return m, nil
 		case "5":
-			m.activeTab = TabLogs
-			m.refreshLogViewport()
+			m.switchTab(TabLogs)
 			return m, nil
 		}
 	} else if key == "f1" {
@@ -568,9 +580,13 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.conversations, _ = m.deps.ConvStore.List()
 			}
 			m.renamingConv = false
+			m.chatInput.Focus()
+			m.chatFocused = true
 			return m, nil
 		case "esc":
 			m.renamingConv = false
+			m.chatInput.Focus()
+			m.chatFocused = true
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -587,9 +603,13 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.statusMsg = "Imagem anexada: " + filepath.Base(p)
 			}
 			m.attachingImg = false
+			m.chatInput.Focus()
+			m.chatFocused = true
 			return m, nil
 		case "esc":
 			m.attachingImg = false
+			m.chatInput.Focus()
+			m.chatFocused = true
 			return m, nil
 		}
 		var cmd tea.Cmd
@@ -603,6 +623,7 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc", "ctrl+p":
 			m.chatParams = false
 			m.chatInput.Focus()
+			m.chatFocused = true
 			return m, nil
 		case "tab", "down":
 			inputs[m.paramFocusIdx].Blur()
@@ -621,25 +642,22 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch key {
-	case "alt+1", "ctrl+1":
-		m.activeTab = TabChat
-		return m, nil
-	case "alt+2", "ctrl+2":
-		m.activeTab = TabImages
-		return m, nil
-	case "alt+3", "ctrl+3":
-		m.activeTab = TabModels
-		return m, nil
-	case "alt+4", "ctrl+4":
-		m.activeTab = TabMonitor
-		if m.deps.SysMon != nil {
-			m.metrics = m.deps.SysMon.Sample()
+	case "esc":
+		m.chatFocused = !m.chatFocused
+		if m.chatFocused {
+			m.chatInput.Focus()
+			m.statusMsg = "Foco na caixa de mensagem."
+		} else {
+			m.chatInput.Blur()
+			m.statusMsg = "Foco nos menus (use 1..5 para abas ou i/Enter para digitar)."
 		}
 		return m, nil
-	case "alt+5", "ctrl+5":
-		m.activeTab = TabLogs
-		m.refreshLogViewport()
-		return m, nil
+	case "i":
+		if !m.chatFocused {
+			m.chatFocused = true
+			m.chatInput.Focus()
+			return m, nil
+		}
 	case "ctrl+n":
 		m.activeConv = store.Conversation{
 			ID:    time.Now().Format("20060102-150405"),
@@ -670,15 +688,20 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.chatParams = true
 		m.paramFocusIdx = 0
 		m.chatInput.Blur()
+		m.chatFocused = false
 		m.systemPrompt.Focus()
 		return m, nil
 	case "ctrl+r":
 		m.renamingConv = true
+		m.chatInput.Blur()
+		m.chatFocused = false
 		m.renameInput.SetValue(m.activeConv.Title)
 		m.renameInput.Focus()
 		return m, nil
 	case "ctrl+a":
 		m.attachingImg = true
+		m.chatInput.Blur()
+		m.chatFocused = false
 		m.attachInput.SetValue("")
 		m.attachInput.Focus()
 		return m, nil
@@ -698,6 +721,11 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
+		if !m.chatFocused {
+			m.chatFocused = true
+			m.chatInput.Focus()
+			return m, nil
+		}
 		if m.streaming {
 			return m, nil
 		}
@@ -735,6 +763,9 @@ func (m *AppModel) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.startChatStreamCmd()
 	}
 
+	if !m.chatFocused {
+		return m, nil
+	}
 	var cmd tea.Cmd
 	m.chatInput, cmd = m.chatInput.Update(msg)
 	return m, cmd
@@ -811,7 +842,7 @@ func waitNextDownloadProgress(id string, ch <-chan models.DownloadProgress) tea.
 
 func (m *AppModel) handleImagesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
-	totalFocus := len(m.imgInputs) + 1 // 0..8 = campos, 9 = botão Gerar
+	totalFocus := len(m.imgInputs) + 1
 
 	switch key {
 	case "tab", "down":
@@ -1105,8 +1136,8 @@ func (m AppModel) View() string {
 
 	if m.showSplash {
 		return lipgloss.NewStyle().Padding(2, 4).Render(
-			fmt.Sprintf("%s\n\nBackend: %s | GPU: %s\n\nPressione Enter para continuar.",
-				pal.Accent.Render("Local AI Studio TUI"), m.deps.Hardware.SelectedBackend, m.deps.Hardware.GPUName),
+			fmt.Sprintf("%s\n\nAperte Enter para continuar",
+				pal.Accent.Render("Local AI Studio TUI")),
 		)
 	}
 
@@ -1122,8 +1153,8 @@ func (m AppModel) View() string {
 	if m.showHelp {
 		return lipgloss.NewStyle().Padding(2, 4).Render(
 			pal.Accent.Render("Atalhos Principais") + "\n\n" +
-				"1..5 (ou Alt+1..5): Alternar abas (Chat, Imagens, Modelos, Monitor, Logs)\n" +
-				"Chat: Ctrl+N Novo chat | Ctrl+H Histórico | Ctrl+↑/↓ Trocar chat | Ctrl+P Parâmetros | Ctrl+R Renomear | Ctrl+A Anexar | Ctrl+Y Copiar | Ctrl+S Parar\n" +
+				"1..5: Alternar abas (Chat, Imagens, Modelos, Monitor, Logs)\n" +
+				"Chat: Esc Alterna foco prompt/menus | Ctrl+N Novo chat | Ctrl+H Histórico | Ctrl+↑/↓ Trocar chat | Ctrl+P Parâmetros | Ctrl+R Renomear | Ctrl+A Anexar | Ctrl+Y Copiar | Ctrl+S Parar\n" +
 				"Imagens: ↑/↓/Tab Navegar campos | Ctrl+G Gerar imagem | Ctrl+X Cancelar | Ctrl+O Abrir\n" +
 				"Modelos: ↑/↓ Navegar | Enter Baixar/Selecionar | Tab Alternar lista | i Importar local | d Excluir\n" +
 				"Geral: ? ou F1 Ajuda | Ctrl+C Sair",
@@ -1150,7 +1181,7 @@ func (m AppModel) View() string {
 	var body string
 	switch m.activeTab {
 	case TabChat:
-		toolbar := pal.Muted.Render("[Ctrl+N] Novo Chat  [Ctrl+H] Histórico  [Ctrl+↑/↓] Alternar  [Ctrl+P] Parâmetros  [Ctrl+R] Renomear  [Ctrl+A] Anexar  [Ctrl+Y] Copiar")
+		toolbar := pal.Muted.Render("[Esc] Foco Menus/Prompt  [Ctrl+N] Novo Chat  [Ctrl+H] Histórico  [Ctrl+↑/↓] Alternar  [Ctrl+P] Parâmetros  [Ctrl+R] Renomear  [Ctrl+A] Anexar  [Ctrl+Y] Copiar")
 		mainChat := fmt.Sprintf("%s\n\n%s", m.chatViewport.View(), m.chatInput.View())
 		if m.renamingConv {
 			mainChat = "Renomear conversa: " + m.renameInput.View() + "\n\n" + mainChat
